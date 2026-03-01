@@ -37,10 +37,12 @@ func newRouter(log zerolog.Logger) *chi.Mux {
 			Msg("health check")
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
 			"version": version,
-		})
+		}); err != nil {
+			log.Error().Err(err).Msg("failed to write health response")
+		}
 	})
 	return r
 }
