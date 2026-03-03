@@ -9,6 +9,7 @@ import (
 	"github.com/community-app/community-backend/internal/config"
 	"github.com/community-app/community-backend/internal/shared/logger"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 	"github.com/rs/zerolog"
 	"go.uber.org/fx"
 )
@@ -27,8 +28,14 @@ func main() {
 	).Run()
 }
 
-func newRouter(log zerolog.Logger) *chi.Mux {
+func newRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{cfg.CORSAllowedOrigins},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		AllowCredentials: true,
+	}))
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		log.Info().
 			Str("method", r.Method).
