@@ -60,7 +60,7 @@ func startServer(lc fx.Lifecycle, cfg *config.Config, log zerolog.Logger, r *chi
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			log.Info().Str("addr", addr).Str("version", version).Msg("server starting")
+			log.Info().Str("addr", addr).Str("version", version).Str("cors_origins", cfg.CORSAllowedOrigins).Msg("server starting")
 			go func() {
 				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 					log.Fatal().Err(err).Msg("server error")
