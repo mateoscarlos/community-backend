@@ -10,7 +10,7 @@ type Config struct {
 	// Server
 	Port               string `envconfig:"PORT" default:"8080"`
 	Env                string `envconfig:"ENV" default:"local"` // local | dev | prod
-	CORSAllowedOrigins string `envconfig:"CORS_ALLOWED_ORIGINS" default:"http://localhost:5173"`
+	CORSAllowedOrigins string `envconfig:"CORS_ALLOWED_ORIGINS"`
 
 	// Logging
 	LogLevel     string `envconfig:"LOG_LEVEL" default:"info"` // debug | info | warn | error
