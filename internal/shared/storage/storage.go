@@ -25,15 +25,17 @@ func New(cfg *config.Config, log zerolog.Logger) (*Storage, error) {
 		accessKey string
 		secretKey string
 		bucket    string
+		region    string
 		useSSL    bool
 	)
 
 	switch cfg.StorageDriver {
 	case "s3":
-		endpoint = "s3.amazonaws.com"
+		endpoint = cfg.S3Endpoint
 		accessKey = cfg.AWSAccessKeyID
 		secretKey = cfg.AWSSecretKey
 		bucket = cfg.S3Bucket
+		region = cfg.AWSRegion
 		useSSL = true
 	default: // minio
 		endpoint = cfg.MinioEndpoint
@@ -46,6 +48,7 @@ func New(cfg *config.Config, log zerolog.Logger) (*Storage, error) {
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: useSSL,
+		Region: region,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("init storage client: %w", err)

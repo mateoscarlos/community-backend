@@ -31,6 +31,7 @@ type Config struct {
 	AWSAccessKeyID string `envconfig:"AWS_ACCESS_KEY_ID"`
 	AWSSecretKey   string `envconfig:"AWS_SECRET_ACCESS_KEY"`
 	S3Bucket       string `envconfig:"S3_BUCKET"`
+	S3Endpoint     string `envconfig:"S3_ENDPOINT" default:"s3.amazonaws.com"` // override for R2/other S3-compatible
 }
 
 // Load reads configuration from environment variables.
