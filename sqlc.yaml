@@ -1,0 +1,88 @@
+version: "2"
+sql:
+  # Shared / infrastructure queries (health check ping)
+  - engine: "postgresql"
+    queries: "internal/shared/postgres/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "db"
+        out: "internal/shared/postgres/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+
+  # dailyimage module queries
+  - engine: "postgresql"
+    queries: "internal/modules/dailyimage/repository/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "dailyimagedb"
+        out: "internal/modules/dailyimage/repository/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+
+  # grid module queries
+  - engine: "postgresql"
+    queries: "internal/modules/grid/repository/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "griddb"
+        out: "internal/modules/grid/repository/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+
+  # claim module queries
+  - engine: "postgresql"
+    queries: "internal/modules/claim/repository/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "claimdb"
+        out: "internal/modules/claim/repository/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+
+  # submission module queries
+  - engine: "postgresql"
+    queries: "internal/modules/submission/repository/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "submissiondb"
+        out: "internal/modules/submission/repository/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+
+  # feedback module queries
+  - engine: "postgresql"
+    queries: "internal/modules/feedback/repository/queries"
+    schema: "migrations"
+    gen:
+      go:
+        package: "feedbackdb"
+        out: "internal/modules/feedback/repository/db"
+        sql_package: "database/sql"
+        emit_interface: true
+        emit_json_tags: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
