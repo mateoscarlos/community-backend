@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	ErrTileNotFree    = errors.New("tile is not free")
-	ErrAlreadyClaimed = errors.New("tile already claimed")
-	ErrNotYourClaim   = errors.New("claim does not belong to this session")
-	ErrClaimNotFound  = errors.New("claim not found")
+	ErrTileNotFree            = errors.New("tile is not free")
+	ErrAlreadyClaimed         = errors.New("tile already claimed")
+	ErrNotYourClaim           = errors.New("claim does not belong to this session")
+	ErrClaimNotFound          = errors.New("claim not found")
+	ErrSessionAlreadyHasClaim = errors.New("session already has an active claim")
 )
 
 type Claim struct {

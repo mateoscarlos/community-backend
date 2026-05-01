@@ -8,6 +8,8 @@ package dailyimagedb
 import (
 	"context"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const deactivateAllDailyImages = `-- name: DeactivateAllDailyImages :exec
@@ -51,6 +53,28 @@ WHERE date = $1
 
 func (q *Queries) GetDailyImageByDate(ctx context.Context, date time.Time) (DailyImage, error) {
 	row := q.db.QueryRowContext(ctx, getDailyImageByDate, date)
+	var i DailyImage
+	err := row.Scan(
+		&i.ID,
+		&i.Date,
+		&i.StorageKey,
+		&i.Width,
+		&i.Height,
+		&i.IsActive,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getDailyImageByID = `-- name: GetDailyImageByID :one
+SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
+FROM daily_images
+WHERE id = $1
+`
+
+func (q *Queries) GetDailyImageByID(ctx context.Context, id uuid.UUID) (DailyImage, error) {
+	row := q.db.QueryRowContext(ctx, getDailyImageByID, id)
 	var i DailyImage
 	err := row.Scan(
 		&i.ID,

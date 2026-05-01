@@ -9,6 +9,11 @@ SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
 FROM daily_images
 WHERE date = $1;
 
+-- name: GetDailyImageByID :one
+SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
+FROM daily_images
+WHERE id = $1;
+
 -- name: DeactivateAllDailyImages :exec
 UPDATE daily_images SET is_active = false, updated_at = now()
 WHERE is_active = true;

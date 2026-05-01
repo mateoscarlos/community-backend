@@ -19,9 +19,15 @@ type Querier interface {
 	GetGridConfig(ctx context.Context, phase int32) (GridConfig, error)
 	GetPeriodByID(ctx context.Context, id uuid.UUID) (Period, error)
 	GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPeriodAndPhaseParams) ([]GetTilesByPeriodAndPhaseRow, error)
+	// Lists periods that have a composed mosaic. Includes both completed and
+	// still-active periods, so today's in-progress mosaic appears in the archive.
 	ListCompletedPeriods(ctx context.Context, arg ListCompletedPeriodsParams) ([]Period, error)
+	ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]Period, error)
+	ListMosaicsByPeriod(ctx context.Context, periodID uuid.UUID) ([]PeriodMosaic, error)
+	SetPeriodFinalImage(ctx context.Context, arg SetPeriodFinalImageParams) error
 	UpdatePeriodPhase(ctx context.Context, arg UpdatePeriodPhaseParams) error
 	UpdateTileStatus(ctx context.Context, arg UpdateTileStatusParams) error
+	UpsertPeriodMosaic(ctx context.Context, arg UpsertPeriodMosaicParams) error
 }
 
 var _ Querier = (*Queries)(nil)

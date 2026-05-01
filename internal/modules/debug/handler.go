@@ -1,8 +1,13 @@
 package debug
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"time"
 
@@ -43,7 +48,21 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Post("/period/reset", h.resetPeriod)
 		r.Post("/tiles/{id}/reset", h.resetTile)
 		r.Post("/tiles/draw-all", h.drawAllTiles)
+		r.Post("/recompose-archives", h.recomposeArchives)
 	})
+}
+
+// recomposeArchives backfills final mosaic images for completed periods that
+// don't have one yet (e.g. periods that completed before composition existed).
+// Usage: POST /debug/recompose-archives
+func (h *Handler) recomposeArchives(w http.ResponseWriter, r *http.Request) {
+	count, err := h.gridSvc.RecomposeMissing(r.Context())
+	if err != nil {
+		h.log.Error().Err(err).Msg("recompose archives")
+		httpserver.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]int{"composed": count})
 }
 
 // getUploadURL returns a presigned PUT URL so you can upload directly to MinIO.
@@ -305,7 +324,9 @@ func (h *Handler) resetTile(w http.ResponseWriter, r *http.Request) {
 }
 
 // drawAllTiles marks all free/locked tiles in the active period as drawn (god mode).
-// Also creates dummy submissions so the phase completion logic works.
+// For each tile it: uploads a colored placeholder JPEG, creates a real claim,
+// records a submission, and flips the tile to drawn. The colored placeholders
+// give the composer real bytes to stitch so the archive mosaic is visible.
 // Usage: POST /debug/tiles/draw-all
 func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -316,79 +337,120 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all non-drawn tiles for current phase
+	type tileRow struct {
+		id  uuid.UUID
+		row int
+		col int
+	}
+
 	rows, err := h.db.QueryContext(ctx,
-		`SELECT id FROM tiles WHERE period_id = $1 AND phase = $2 AND status != 'drawn'`,
+		`SELECT id, row_index, col_index FROM tiles
+		 WHERE period_id = $1 AND phase = $2 AND status != 'drawn'`,
 		period.ID, period.Phase,
 	)
 	if err != nil {
-		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		h.log.Error().Err(err).Msg("draw-all: query tiles")
+		httpserver.WriteError(w, http.StatusInternalServerError, "query tiles failed")
 		return
 	}
 	defer rows.Close()
 
-	var tileIDs []uuid.UUID
+	var tiles []tileRow
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		var t tileRow
+		if err := rows.Scan(&t.id, &t.row, &t.col); err != nil {
+			h.log.Error().Err(err).Msg("draw-all: scan tile")
+			httpserver.WriteError(w, http.StatusInternalServerError, "scan tile failed")
 			return
 		}
-		tileIDs = append(tileIDs, id)
+		tiles = append(tiles, t)
 	}
 
-	if len(tileIDs) == 0 {
+	if len(tiles) == 0 {
 		httpserver.WriteJSON(w, http.StatusOK, map[string]any{
 			"drawn": 0, "message": "all tiles already drawn",
 		})
 		return
 	}
 
+	// Upload a colored placeholder per tile. Done before the DB transaction
+	// because object storage is not transactional; orphans on tx-rollback are
+	// acceptable for a debug endpoint.
+	for _, t := range tiles {
+		jpg, err := makePlaceholderJPEG(t.row, t.col)
+		if err != nil {
+			h.log.Error().Err(err).Msg("draw-all: encode placeholder")
+			httpserver.WriteError(w, http.StatusInternalServerError, "encode placeholder failed")
+			return
+		}
+		key := fmt.Sprintf("tiles/%s.jpg", t.id.String())
+		if err := h.store.PutObject(ctx, key, jpg, "image/jpeg"); err != nil {
+			h.log.Error().Err(err).Str("key", key).Msg("draw-all: upload placeholder")
+			httpserver.WriteError(w, http.StatusInternalServerError, "upload placeholder failed")
+			return
+		}
+	}
+
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		httpserver.WriteError(w, http.StatusInternalServerError, "begin tx failed")
 		return
 	}
 	defer tx.Rollback()
 
-	for _, id := range tileIDs {
-		// Delete existing claims
-		if _, err := tx.ExecContext(ctx, `DELETE FROM claims WHERE tile_id = $1`, id); err != nil {
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+	for _, t := range tiles {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM claims WHERE tile_id = $1`, t.id); err != nil {
+			h.log.Error().Err(err).Msg("draw-all: delete claims")
+			httpserver.WriteError(w, http.StatusInternalServerError, "delete claims failed")
 			return
 		}
-		// Create dummy submission
+
+		var claimID uuid.UUID
+		err := tx.QueryRowContext(ctx,
+			`INSERT INTO claims (tile_id, nickname, session_id, expires_at)
+			 VALUES ($1, 'debug', 'debug-draw-all', now() + interval '1 hour')
+			 RETURNING id`,
+			t.id,
+		).Scan(&claimID)
+		if err != nil {
+			h.log.Error().Err(err).Msg("draw-all: insert claim")
+			httpserver.WriteError(w, http.StatusInternalServerError, "insert claim failed")
+			return
+		}
+
+		key := fmt.Sprintf("tiles/%s.jpg", t.id.String())
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO submissions (tile_id, claim_id, storage_key, crop_x, crop_y, crop_width, crop_height)
-			 VALUES ($1, '00000000-0000-0000-0000-000000000000', 'debug/placeholder.jpg', 0, 0, 100, 100)
-			 ON CONFLICT (tile_id) DO NOTHING`,
-			id,
+			 VALUES ($1, $2, $3, 0, 0, 1, 1)
+			 ON CONFLICT (tile_id) DO UPDATE SET claim_id = EXCLUDED.claim_id, storage_key = EXCLUDED.storage_key`,
+			t.id, claimID, key,
 		); err != nil {
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+			h.log.Error().Err(err).Msg("draw-all: insert submission")
+			httpserver.WriteError(w, http.StatusInternalServerError, "insert submission failed")
 			return
 		}
-		// Mark as drawn
+
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE tiles SET status = 'drawn', updated_at = now() WHERE id = $1`, id,
+			`UPDATE tiles SET status = 'drawn', updated_at = now() WHERE id = $1`, t.id,
 		); err != nil {
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+			h.log.Error().Err(err).Msg("draw-all: update tile")
+			httpserver.WriteError(w, http.StatusInternalServerError, "update tile failed")
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		h.log.Error().Err(err).Msg("draw-all: commit")
+		httpserver.WriteError(w, http.StatusInternalServerError, "commit failed")
 		return
 	}
 
-	// Publish SSE events for each tile
-	for _, id := range tileIDs {
-		h.broker.PublishTileEvent(sse.EventTileDrawn, id.String(), "drawn")
+	for _, t := range tiles {
+		h.broker.PublishTileEvent(sse.EventTileDrawn, t.id.String(), "drawn")
 	}
 
-	h.log.Info().Int("count", len(tileIDs)).Msg("drew all tiles (debug)")
+	h.log.Info().Int("count", len(tiles)).Msg("drew all tiles (debug)")
 
-	// Check phase completion
 	result, err := h.gridSvc.CheckPhaseCompletion(ctx, period.ID)
 	if err != nil {
 		h.log.Error().Err(err).Msg("check phase completion after draw-all")
@@ -402,7 +464,30 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
-		"drawn":   len(tileIDs),
+		"drawn":   len(tiles),
 		"message": "all tiles marked as drawn",
 	})
+}
+
+// makePlaceholderJPEG returns a small solid-color JPEG keyed off the tile's
+// (row, col) so the resulting mosaic shows distinct cells.
+func makePlaceholderJPEG(row, col int) ([]byte, error) {
+	const size = 64
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+	c := color.RGBA{
+		R: uint8(60 + (row*53)%180),
+		G: uint8(60 + (col*97)%180),
+		B: uint8(60 + ((row+col)*73)%180),
+		A: 255,
+	}
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			img.SetRGBA(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

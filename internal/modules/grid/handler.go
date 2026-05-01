@@ -119,6 +119,16 @@ func (h *Handler) listArchive(w http.ResponseWriter, r *http.Request) {
 		if p.EndedAt != nil {
 			items[i].EndedAt = p.EndedAt
 		}
+		if p.FinalImageKey != "" {
+			// Calendar day cells are tiny — presign the thumb variant to
+			// keep payloads light. The thumb is generated alongside the full
+			// in ComposeFinalImage; periods composed before thumbs existed
+			// won't have one and will 404 on the browser side.
+			thumbKey := ThumbnailKey(p.FinalImageKey)
+			if u, err := h.store.PresignedGetURL(r.Context(), thumbKey, presignExpiry); err == nil {
+				items[i].FinalImageURL = u
+			}
+		}
 	}
 
 	httpserver.WriteJSON(w, http.StatusOK, archiveListResponse{
@@ -129,19 +139,11 @@ func (h *Handler) listArchive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (*periodResponse, error) {
-	img, err := h.imgRepo.GetByDate(r.Context(), current.Period.StartedAt)
-	if err != nil {
-		// Fall back to fetching by ID if date lookup fails.
-		_ = err
-	}
-	_ = img
-
-	// Generate presigned image URL from daily image.
+	// Fetch the period's own daily image (not the currently-active one), so the
+	// archive detail page shows the original picture for that day.
 	var imageResp *imageResponse
-	imgDomain, err := h.imgRepo.GetActive(r.Context())
-	if err == nil {
-		imgURL, urlErr := h.store.PresignedGetURL(r.Context(), imgDomain.StorageKey, presignExpiry)
-		if urlErr == nil {
+	if imgDomain, err := h.imgRepo.GetByID(r.Context(), current.Period.DailyImageID); err == nil {
+		if imgURL, urlErr := h.store.PresignedGetURL(r.Context(), imgDomain.StorageKey, presignExpiry); urlErr == nil {
 			imageResp = &imageResponse{
 				ID:               imgDomain.ID.String(),
 				Date:             imgDomain.Date.Format("2006-01-02"),
@@ -168,14 +170,30 @@ func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (
 		}
 	}
 
+	// Per-phase mosaics — every "draw" of the day, oldest first.
+	mosaics, _ := h.svc.ListMosaics(r.Context(), current.Period.ID)
+	mosaicResps := make([]phaseMosaicResponse, 0, len(mosaics))
+	for _, m := range mosaics {
+		url, err := h.store.PresignedGetURL(r.Context(), m.StorageKey, presignExpiry)
+		if err != nil {
+			continue
+		}
+		mosaicResps = append(mosaicResps, phaseMosaicResponse{
+			Phase:      m.Phase,
+			ImageURL:   url,
+			ComposedAt: m.ComposedAt,
+		})
+	}
+
 	return &periodResponse{
 		Period: periodInfo{
-			ID:        current.Period.ID.String(),
-			GameType:  current.Period.GameType,
-			Status:    string(current.Period.Status),
-			Phase:     current.Period.Phase,
-			StartedAt: current.Period.StartedAt,
-			Image:     imageResp,
+			ID:            current.Period.ID.String(),
+			GameType:      current.Period.GameType,
+			Status:        string(current.Period.Status),
+			Phase:         current.Period.Phase,
+			StartedAt:     current.Period.StartedAt,
+			Image:         imageResp,
+			PhaseMosaics:  mosaicResps,
 		},
 		Grid: gridResponse{
 			Columns:    current.GridConfig.Columns,
@@ -195,12 +213,19 @@ type periodResponse struct {
 }
 
 type periodInfo struct {
-	ID        string         `json:"id"`
-	GameType  string         `json:"game_type"`
-	Status    string         `json:"status"`
-	Phase     int            `json:"phase"`
-	StartedAt time.Time      `json:"started_at"`
-	Image     *imageResponse `json:"image,omitempty"`
+	ID           string                `json:"id"`
+	GameType     string                `json:"game_type"`
+	Status       string                `json:"status"`
+	Phase        int                   `json:"phase"`
+	StartedAt    time.Time             `json:"started_at"`
+	Image        *imageResponse        `json:"image,omitempty"`
+	PhaseMosaics []phaseMosaicResponse `json:"phase_mosaics,omitempty"`
+}
+
+type phaseMosaicResponse struct {
+	Phase      int       `json:"phase"`
+	ImageURL   string    `json:"image_url"`
+	ComposedAt time.Time `json:"composed_at"`
 }
 
 type imageResponse struct {
@@ -235,9 +260,10 @@ type archiveListResponse struct {
 }
 
 type archivePeriodResponse struct {
-	ID        string     `json:"id"`
-	GameType  string     `json:"game_type"`
-	Phase     int        `json:"phase"`
-	StartedAt time.Time  `json:"started_at"`
-	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	ID            string     `json:"id"`
+	GameType      string     `json:"game_type"`
+	Phase         int        `json:"phase"`
+	StartedAt     time.Time  `json:"started_at"`
+	EndedAt       *time.Time `json:"ended_at,omitempty"`
+	FinalImageURL string     `json:"final_image_url,omitempty"`
 }

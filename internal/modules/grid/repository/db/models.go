@@ -49,15 +49,24 @@ type GridConfig struct {
 }
 
 type Period struct {
-	ID           uuid.UUID    `json:"id"`
-	DailyImageID uuid.UUID    `json:"daily_image_id"`
-	GameType     string       `json:"game_type"`
-	Status       string       `json:"status"`
-	Phase        int32        `json:"phase"`
-	StartedAt    time.Time    `json:"started_at"`
-	EndedAt      sql.NullTime `json:"ended_at"`
-	CreatedAt    time.Time    `json:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at"`
+	ID            uuid.UUID      `json:"id"`
+	DailyImageID  uuid.UUID      `json:"daily_image_id"`
+	GameType      string         `json:"game_type"`
+	Status        string         `json:"status"`
+	Phase         int32          `json:"phase"`
+	StartedAt     time.Time      `json:"started_at"`
+	EndedAt       sql.NullTime   `json:"ended_at"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	FinalImageKey sql.NullString `json:"final_image_key"`
+	ComposedAt    sql.NullTime   `json:"composed_at"`
+}
+
+type PeriodMosaic struct {
+	PeriodID   uuid.UUID `json:"period_id"`
+	Phase      int32     `json:"phase"`
+	StorageKey string    `json:"storage_key"`
+	ComposedAt time.Time `json:"composed_at"`
 }
 
 type SchemaInfo struct {

@@ -44,8 +44,8 @@ func (h *Handler) claimTile(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if body.Nickname == "" || body.SessionID == "" {
-		httpserver.WriteError(w, http.StatusBadRequest, "nickname and session_id are required")
+	if body.SessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "session_id is required")
 		return
 	}
 
@@ -53,6 +53,10 @@ func (h *Handler) claimTile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, ErrAlreadyClaimed) {
 			httpserver.WriteError(w, http.StatusConflict, "tile already claimed")
+			return
+		}
+		if errors.Is(err, ErrSessionAlreadyHasClaim) {
+			httpserver.WriteError(w, http.StatusConflict, "session already has an active claim")
 			return
 		}
 		h.log.Error().Err(err).Msg("claim tile")

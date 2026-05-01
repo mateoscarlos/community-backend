@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	dailyimagedb "github.com/community-app/community-backend/internal/modules/dailyimage/repository/db"
 )
 
@@ -17,6 +19,7 @@ var ErrNotFound = errors.New("daily image not found")
 type Repository interface {
 	GetActive(ctx context.Context) (*DailyImage, error)
 	GetByDate(ctx context.Context, date time.Time) (*DailyImage, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*DailyImage, error)
 	SetActive(ctx context.Context, date time.Time, storageKey string, width, height int) (*DailyImage, error)
 }
 
@@ -47,6 +50,17 @@ func (r *postgresRepository) GetByDate(ctx context.Context, date time.Time) (*Da
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get daily image by date: %w", err)
+	}
+	return toDomain(row), nil
+}
+
+func (r *postgresRepository) GetByID(ctx context.Context, id uuid.UUID) (*DailyImage, error) {
+	row, err := r.queries.GetDailyImageByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get daily image by id: %w", err)
 	}
 	return toDomain(row), nil
 }

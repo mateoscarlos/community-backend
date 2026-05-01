@@ -27,6 +27,7 @@ type Repository interface {
 
 	GetClaimByTileID(ctx context.Context, tileID uuid.UUID) (*Claim, error)
 	GetActiveClaimBySessionAndTile(ctx context.Context, tileID uuid.UUID, sessionID string) (*Claim, error)
+	HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error)
 }
 
 type postgresRepository struct {
@@ -121,6 +122,23 @@ func (r *postgresRepository) GetActiveClaimBySessionAndTile(ctx context.Context,
 		return nil, fmt.Errorf("get claim by session and tile: %w", err)
 	}
 	return toDomain(row), nil
+}
+
+func (r *postgresRepository) HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM claims
+			WHERE session_id = $1
+			  AND released_at IS NULL
+			  AND expires_at > NOW()
+		)`,
+		sessionID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("has active claim for session: %w", err)
+	}
+	return exists, nil
 }
 
 func toDomain(row claimdb.Claim) *Claim {

@@ -7,12 +7,15 @@ package dailyimagedb
 import (
 	"context"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Querier interface {
 	DeactivateAllDailyImages(ctx context.Context) error
 	GetActiveDailyImage(ctx context.Context) (DailyImage, error)
 	GetDailyImageByDate(ctx context.Context, date time.Time) (DailyImage, error)
+	GetDailyImageByID(ctx context.Context, id uuid.UUID) (DailyImage, error)
 	UpsertDailyImage(ctx context.Context, arg UpsertDailyImageParams) (DailyImage, error)
 }
 

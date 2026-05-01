@@ -23,15 +23,17 @@ const (
 )
 
 type Period struct {
-	ID           uuid.UUID
-	DailyImageID uuid.UUID
-	GameType     string
-	Status       PeriodStatus
-	Phase        int
-	StartedAt    time.Time
-	EndedAt      *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            uuid.UUID
+	DailyImageID  uuid.UUID
+	GameType      string
+	Status        PeriodStatus
+	Phase         int
+	StartedAt     time.Time
+	EndedAt       *time.Time
+	FinalImageKey string // empty if not yet composed
+	ComposedAt    *time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 type Tile struct {
@@ -52,4 +54,11 @@ type GridConfig struct {
 	Columns   int
 	Rows      int
 	CreatedAt time.Time
+}
+
+type PhaseMosaic struct {
+	PeriodID   uuid.UUID
+	Phase      int
+	StorageKey string
+	ComposedAt time.Time
 }

@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/community-app/community-backend/internal/config"
@@ -92,4 +94,31 @@ func (s *Storage) PresignedPutURL(ctx context.Context, key string, expiry time.D
 		return "", fmt.Errorf("presign put %q: %w", key, err)
 	}
 	return u.String(), nil
+}
+
+// GetObject downloads an object's bytes server-side.
+func (s *Storage) GetObject(ctx context.Context, key string) ([]byte, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get %q: %w", key, err)
+	}
+	defer obj.Close()
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", key, err)
+	}
+	return data, nil
+}
+
+// PutObject uploads bytes to storage server-side.
+func (s *Storage) PutObject(ctx context.Context, key string, data []byte, contentType string) error {
+	_, err := s.client.PutObject(
+		ctx, s.bucket, key,
+		bytes.NewReader(data), int64(len(data)),
+		minio.PutObjectOptions{ContentType: contentType},
+	)
+	if err != nil {
+		return fmt.Errorf("put %q: %w", key, err)
+	}
+	return nil
 }

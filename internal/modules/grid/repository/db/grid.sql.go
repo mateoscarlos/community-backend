@@ -7,6 +7,7 @@ package griddb
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,7 +50,7 @@ func (q *Queries) CountTilesByStatus(ctx context.Context, arg CountTilesByStatus
 const createPeriod = `-- name: CreatePeriod :one
 INSERT INTO periods (daily_image_id, game_type, status, phase)
 VALUES ($1, $2, $3, $4)
-RETURNING id, daily_image_id, game_type, status, phase, started_at, ended_at, created_at, updated_at
+RETURNING id, daily_image_id, game_type, status, phase, started_at, ended_at, created_at, updated_at, final_image_key, composed_at
 `
 
 type CreatePeriodParams struct {
@@ -77,6 +78,8 @@ func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Per
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.FinalImageKey,
+		&i.ComposedAt,
 	)
 	return i, err
 }
@@ -117,7 +120,8 @@ func (q *Queries) CreateTile(ctx context.Context, arg CreateTileParams) (Tile, e
 
 const getActivePeriod = `-- name: GetActivePeriod :one
 SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
-       p.started_at, p.ended_at, p.created_at, p.updated_at
+       p.started_at, p.ended_at, p.created_at, p.updated_at,
+       p.final_image_key, p.composed_at
 FROM periods p
 WHERE p.status = 'active'
 LIMIT 1
@@ -136,6 +140,8 @@ func (q *Queries) GetActivePeriod(ctx context.Context) (Period, error) {
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.FinalImageKey,
+		&i.ComposedAt,
 	)
 	return i, err
 }
@@ -161,7 +167,8 @@ func (q *Queries) GetGridConfig(ctx context.Context, phase int32) (GridConfig, e
 
 const getPeriodByID = `-- name: GetPeriodByID :one
 SELECT id, daily_image_id, game_type, status, phase,
-       started_at, ended_at, created_at, updated_at
+       started_at, ended_at, created_at, updated_at,
+       final_image_key, composed_at
 FROM periods
 WHERE id = $1
 `
@@ -179,6 +186,8 @@ func (q *Queries) GetPeriodByID(ctx context.Context, id uuid.UUID) (Period, erro
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.FinalImageKey,
+		&i.ComposedAt,
 	)
 	return i, err
 }
@@ -245,10 +254,11 @@ func (q *Queries) GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPe
 
 const listCompletedPeriods = `-- name: ListCompletedPeriods :many
 SELECT id, daily_image_id, game_type, status, phase,
-       started_at, ended_at, created_at, updated_at
+       started_at, ended_at, created_at, updated_at,
+       final_image_key, composed_at
 FROM periods
-WHERE status = 'completed'
-ORDER BY ended_at DESC
+WHERE final_image_key IS NOT NULL
+ORDER BY started_at DESC
 LIMIT $1 OFFSET $2
 `
 
@@ -257,6 +267,8 @@ type ListCompletedPeriodsParams struct {
 	Offset int32 `json:"offset"`
 }
 
+// Lists periods that have a composed mosaic. Includes both completed and
+// still-active periods, so today's in-progress mosaic appears in the archive.
 func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPeriodsParams) ([]Period, error) {
 	rows, err := q.db.QueryContext(ctx, listCompletedPeriods, arg.Limit, arg.Offset)
 	if err != nil {
@@ -276,6 +288,8 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.FinalImageKey,
+			&i.ComposedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -288,6 +302,101 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 		return nil, err
 	}
 	return items, nil
+}
+
+const listCompletedPeriodsMissingFinalImage = `-- name: ListCompletedPeriodsMissingFinalImage :many
+SELECT id, daily_image_id, game_type, status, phase,
+       started_at, ended_at, created_at, updated_at,
+       final_image_key, composed_at
+FROM periods
+WHERE status = 'completed' AND final_image_key IS NULL
+ORDER BY ended_at DESC
+`
+
+func (q *Queries) ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]Period, error) {
+	rows, err := q.db.QueryContext(ctx, listCompletedPeriodsMissingFinalImage)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Period
+	for rows.Next() {
+		var i Period
+		if err := rows.Scan(
+			&i.ID,
+			&i.DailyImageID,
+			&i.GameType,
+			&i.Status,
+			&i.Phase,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FinalImageKey,
+			&i.ComposedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMosaicsByPeriod = `-- name: ListMosaicsByPeriod :many
+SELECT period_id, phase, storage_key, composed_at
+FROM period_mosaics
+WHERE period_id = $1
+ORDER BY phase ASC
+`
+
+func (q *Queries) ListMosaicsByPeriod(ctx context.Context, periodID uuid.UUID) ([]PeriodMosaic, error) {
+	rows, err := q.db.QueryContext(ctx, listMosaicsByPeriod, periodID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PeriodMosaic
+	for rows.Next() {
+		var i PeriodMosaic
+		if err := rows.Scan(
+			&i.PeriodID,
+			&i.Phase,
+			&i.StorageKey,
+			&i.ComposedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setPeriodFinalImage = `-- name: SetPeriodFinalImage :exec
+UPDATE periods
+SET final_image_key = $2, composed_at = now(), updated_at = now()
+WHERE id = $1
+`
+
+type SetPeriodFinalImageParams struct {
+	ID            uuid.UUID      `json:"id"`
+	FinalImageKey sql.NullString `json:"final_image_key"`
+}
+
+func (q *Queries) SetPeriodFinalImage(ctx context.Context, arg SetPeriodFinalImageParams) error {
+	_, err := q.db.ExecContext(ctx, setPeriodFinalImage, arg.ID, arg.FinalImageKey)
+	return err
 }
 
 const updatePeriodPhase = `-- name: UpdatePeriodPhase :exec
@@ -315,5 +424,24 @@ type UpdateTileStatusParams struct {
 
 func (q *Queries) UpdateTileStatus(ctx context.Context, arg UpdateTileStatusParams) error {
 	_, err := q.db.ExecContext(ctx, updateTileStatus, arg.ID, arg.Status)
+	return err
+}
+
+const upsertPeriodMosaic = `-- name: UpsertPeriodMosaic :exec
+INSERT INTO period_mosaics (period_id, phase, storage_key)
+VALUES ($1, $2, $3)
+ON CONFLICT (period_id, phase) DO UPDATE
+SET storage_key = EXCLUDED.storage_key,
+    composed_at = now()
+`
+
+type UpsertPeriodMosaicParams struct {
+	PeriodID   uuid.UUID `json:"period_id"`
+	Phase      int32     `json:"phase"`
+	StorageKey string    `json:"storage_key"`
+}
+
+func (q *Queries) UpsertPeriodMosaic(ctx context.Context, arg UpsertPeriodMosaicParams) error {
+	_, err := q.db.ExecContext(ctx, upsertPeriodMosaic, arg.PeriodID, arg.Phase, arg.StorageKey)
 	return err
 }
