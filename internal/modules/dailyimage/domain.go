@@ -18,3 +18,14 @@ type DailyImage struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
+
+// ScheduledImage is an image queued up to become the active daily image on a
+// future Copenhagen calendar date. The period sweeper promotes it at midnight.
+type ScheduledImage struct {
+	Date       time.Time
+	StorageKey string
+	Width      int
+	Height     int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}

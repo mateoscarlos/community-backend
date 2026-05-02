@@ -14,6 +14,30 @@ SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
 FROM daily_images
 WHERE id = $1;
 
+-- name: UpsertScheduledImage :one
+INSERT INTO daily_image_schedule (date, storage_key, width, height)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (date) DO UPDATE
+    SET storage_key = EXCLUDED.storage_key,
+        width       = EXCLUDED.width,
+        height      = EXCLUDED.height,
+        updated_at  = now()
+RETURNING date, storage_key, width, height, created_at, updated_at;
+
+-- name: GetScheduledByDate :one
+SELECT date, storage_key, width, height, created_at, updated_at
+FROM daily_image_schedule
+WHERE date = $1;
+
+-- name: ListScheduleRange :many
+SELECT date, storage_key, width, height, created_at, updated_at
+FROM daily_image_schedule
+WHERE date >= $1 AND date <= $2
+ORDER BY date ASC;
+
+-- name: DeleteScheduledByDate :exec
+DELETE FROM daily_image_schedule WHERE date = $1;
+
 -- name: DeactivateAllDailyImages :exec
 UPDATE daily_images SET is_active = false, updated_at = now()
 WHERE is_active = true;

@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/community-app/community-backend/internal/modules/dailyimage"
@@ -53,6 +54,15 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Post("/tiles/{id}/reset", h.resetTile)
 		r.Post("/tiles/draw-all", h.drawAllTiles)
 		r.Post("/recompose-archives", h.recomposeArchives)
+
+		// Daily image schedule.
+		r.Get("/schedule", h.listSchedule)
+		r.Post("/schedule", h.upsertSchedule)
+		r.Delete("/schedule/{date}", h.deleteSchedule)
+
+		// Sessions / users.
+		r.Get("/sessions", h.listSessions)
+		r.Get("/sessions/{id}", h.getSession)
 	})
 }
 
@@ -477,6 +487,288 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
 		"drawn":   len(tiles),
 		"message": "all tiles marked as drawn",
+	})
+}
+
+const scheduleListWindowDays = 60
+
+// listSchedule returns the upcoming N days of scheduled images (today
+// inclusive). Each scheduled day includes a presigned URL so the admin UI
+// can preview the image without a separate round-trip per cell.
+// Usage: GET /debug/schedule
+func (h *Handler) listSchedule(w http.ResponseWriter, r *http.Request) {
+	loc, err := time.LoadLocation(grid.PeriodTimezone)
+	if err != nil {
+		h.log.Error().Err(err).Msg("schedule: load tz")
+		httpserver.WriteError(w, http.StatusInternalServerError, "load timezone failed")
+		return
+	}
+	now := time.Now().In(loc)
+	y, m, d := now.Date()
+	from := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	to := from.AddDate(0, 0, scheduleListWindowDays-1)
+
+	rows, err := h.repo.ListSchedule(r.Context(), from, to)
+	if err != nil {
+		h.log.Error().Err(err).Msg("schedule: list")
+		httpserver.WriteError(w, http.StatusInternalServerError, "list schedule failed")
+		return
+	}
+
+	type item struct {
+		Date       string `json:"date"`
+		StorageKey string `json:"storage_key"`
+		Width      int    `json:"width"`
+		Height     int    `json:"height"`
+		ImageURL   string `json:"image_url,omitempty"`
+	}
+	out := make([]item, len(rows))
+	for i, row := range rows {
+		out[i] = item{
+			Date:       row.Date.Format("2006-01-02"),
+			StorageKey: row.StorageKey,
+			Width:      row.Width,
+			Height:     row.Height,
+		}
+		if u, err := h.store.PresignedGetURL(r.Context(), row.StorageKey, 15*time.Minute); err == nil {
+			out[i].ImageURL = u
+		}
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
+		"from":  from.Format("2006-01-02"),
+		"to":    to.Format("2006-01-02"),
+		"items": out,
+	})
+}
+
+// upsertSchedule registers (or replaces) a scheduled image for a given date.
+// Usage: POST /debug/schedule
+//
+//	{"date": "2026-05-10", "storage_key": "schedule/may-10.jpg", "width": 1920, "height": 1080}
+func (h *Handler) upsertSchedule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Date       string `json:"date"`
+		StorageKey string `json:"storage_key"`
+		Width      int    `json:"width"`
+		Height     int    `json:"height"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Date == "" || body.StorageKey == "" || body.Width <= 0 || body.Height <= 0 {
+		httpserver.WriteError(w, http.StatusBadRequest, "date, storage_key, width, height are required")
+		return
+	}
+	date, err := time.Parse("2006-01-02", body.Date)
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
+		return
+	}
+
+	saved, err := h.repo.UpsertScheduled(r.Context(), date, body.StorageKey, body.Width, body.Height)
+	if err != nil {
+		h.log.Error().Err(err).Msg("schedule: upsert")
+		httpserver.WriteError(w, http.StatusInternalServerError, "upsert schedule failed")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
+		"date":        saved.Date.Format("2006-01-02"),
+		"storage_key": saved.StorageKey,
+		"width":       saved.Width,
+		"height":      saved.Height,
+	})
+}
+
+// deleteSchedule removes a scheduled image for a given date.
+// Usage: DELETE /debug/schedule/2026-05-10
+func (h *Handler) deleteSchedule(w http.ResponseWriter, r *http.Request) {
+	dateStr := chi.URLParam(r, "date")
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
+		return
+	}
+
+	if err := h.repo.DeleteScheduledByDate(r.Context(), date); err != nil {
+		h.log.Error().Err(err).Msg("schedule: delete")
+		httpserver.WriteError(w, http.StatusInternalServerError, "delete schedule failed")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listSessions returns one row per distinct session_id ever to claim a tile,
+// with aggregate activity counts. Sorted by last activity desc.
+// Usage: GET /debug/sessions?limit=100
+func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 500 {
+		limit = l
+	}
+
+	const q = `
+		SELECT
+		    c.session_id,
+		    (
+		        SELECT c2.nickname
+		        FROM claims c2
+		        WHERE c2.session_id = c.session_id
+		        ORDER BY c2.claimed_at DESC
+		        LIMIT 1
+		    ) AS latest_nickname,
+		    COUNT(*)                                                AS total_claims,
+		    COUNT(s.id)                                             AS drawn_count,
+		    COUNT(*) FILTER (WHERE c.released_at IS NOT NULL
+		                     AND s.id IS NULL)                      AS released_count,
+		    MIN(c.claimed_at)                                       AS first_seen,
+		    GREATEST(MAX(c.claimed_at), COALESCE(MAX(s.created_at), MAX(c.claimed_at))) AS last_seen
+		FROM claims c
+		LEFT JOIN submissions s ON s.claim_id = c.id
+		GROUP BY c.session_id
+		ORDER BY last_seen DESC
+		LIMIT $1
+	`
+	rows, err := h.db.QueryContext(r.Context(), q, limit)
+	if err != nil {
+		h.log.Error().Err(err).Msg("sessions: list")
+		httpserver.WriteError(w, http.StatusInternalServerError, "list sessions failed")
+		return
+	}
+	defer rows.Close()
+
+	type sessionItem struct {
+		SessionID      string    `json:"session_id"`
+		LatestNickname string    `json:"latest_nickname"`
+		TotalClaims    int64     `json:"total_claims"`
+		DrawnCount     int64     `json:"drawn_count"`
+		ReleasedCount  int64     `json:"released_count"`
+		FirstSeen      time.Time `json:"first_seen"`
+		LastSeen       time.Time `json:"last_seen"`
+	}
+	out := make([]sessionItem, 0)
+	for rows.Next() {
+		var it sessionItem
+		var nickname sql.NullString
+		if err := rows.Scan(
+			&it.SessionID, &nickname,
+			&it.TotalClaims, &it.DrawnCount, &it.ReleasedCount,
+			&it.FirstSeen, &it.LastSeen,
+		); err != nil {
+			h.log.Error().Err(err).Msg("sessions: scan")
+			httpserver.WriteError(w, http.StatusInternalServerError, "scan sessions failed")
+			return
+		}
+		if nickname.Valid {
+			it.LatestNickname = nickname.String
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		httpserver.WriteError(w, http.StatusInternalServerError, "iterate sessions failed")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
+		"sessions": out,
+		"limit":    limit,
+	})
+}
+
+// getSession returns the full claim history for one session, with submission
+// thumbnails presigned for inline preview.
+// Usage: GET /debug/sessions/{id}
+func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "id")
+	if sessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	const q = `
+		SELECT
+		    c.id, c.tile_id, c.nickname,
+		    c.claimed_at, c.expires_at, c.released_at,
+		    s.id, s.storage_key, s.created_at,
+		    t.period_id, t.phase, t.row_index, t.col_index, t.status
+		FROM claims c
+		LEFT JOIN submissions s ON s.claim_id = c.id
+		JOIN tiles t ON t.id = c.tile_id
+		WHERE c.session_id = $1
+		ORDER BY c.claimed_at DESC
+		LIMIT 500
+	`
+	rows, err := h.db.QueryContext(r.Context(), q, sessionID)
+	if err != nil {
+		h.log.Error().Err(err).Msg("session: get")
+		httpserver.WriteError(w, http.StatusInternalServerError, "get session failed")
+		return
+	}
+	defer rows.Close()
+
+	type claimItem struct {
+		ClaimID      string     `json:"claim_id"`
+		TileID       string     `json:"tile_id"`
+		Nickname     string     `json:"nickname"`
+		ClaimedAt    time.Time  `json:"claimed_at"`
+		ExpiresAt    time.Time  `json:"expires_at"`
+		ReleasedAt   *time.Time `json:"released_at,omitempty"`
+		SubmissionID string     `json:"submission_id,omitempty"`
+		SubmittedAt  *time.Time `json:"submitted_at,omitempty"`
+		ImageURL     string     `json:"image_url,omitempty"`
+		PeriodID     string     `json:"period_id"`
+		Phase        int        `json:"phase"`
+		Row          int        `json:"row"`
+		Col          int        `json:"col"`
+		TileStatus   string     `json:"tile_status"`
+	}
+
+	out := make([]claimItem, 0)
+	for rows.Next() {
+		var (
+			it          claimItem
+			released    sql.NullTime
+			subID       sql.NullString
+			subKey      sql.NullString
+			submittedAt sql.NullTime
+		)
+		if err := rows.Scan(
+			&it.ClaimID, &it.TileID, &it.Nickname,
+			&it.ClaimedAt, &it.ExpiresAt, &released,
+			&subID, &subKey, &submittedAt,
+			&it.PeriodID, &it.Phase, &it.Row, &it.Col, &it.TileStatus,
+		); err != nil {
+			h.log.Error().Err(err).Msg("session: scan claim")
+			httpserver.WriteError(w, http.StatusInternalServerError, "scan claim failed")
+			return
+		}
+		if released.Valid {
+			it.ReleasedAt = &released.Time
+		}
+		if subID.Valid {
+			it.SubmissionID = subID.String
+		}
+		if submittedAt.Valid {
+			it.SubmittedAt = &submittedAt.Time
+		}
+		if subKey.Valid && subKey.String != "" {
+			if u, err := h.store.PresignedGetURL(r.Context(), subKey.String, 15*time.Minute); err == nil {
+				it.ImageURL = u
+			}
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		httpserver.WriteError(w, http.StatusInternalServerError, "iterate claims failed")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
+		"session_id": sessionID,
+		"claims":     out,
 	})
 }
 

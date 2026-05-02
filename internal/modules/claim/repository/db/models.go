@@ -12,14 +12,15 @@ import (
 )
 
 type Claim struct {
-	ID         uuid.UUID    `json:"id"`
-	TileID     uuid.UUID    `json:"tile_id"`
-	Nickname   string       `json:"nickname"`
-	SessionID  string       `json:"session_id"`
-	ClaimedAt  time.Time    `json:"claimed_at"`
-	ExpiresAt  time.Time    `json:"expires_at"`
-	ReleasedAt sql.NullTime `json:"released_at"`
-	CreatedAt  time.Time    `json:"created_at"`
+	ID              uuid.UUID    `json:"id"`
+	TileID          uuid.UUID    `json:"tile_id"`
+	Nickname        string       `json:"nickname"`
+	SessionID       string       `json:"session_id"`
+	ClaimedAt       time.Time    `json:"claimed_at"`
+	ExpiresAt       time.Time    `json:"expires_at"`
+	ReleasedAt      sql.NullTime `json:"released_at"`
+	CreatedAt       time.Time    `json:"created_at"`
+	LastHeartbeatAt time.Time    `json:"last_heartbeat_at"`
 }
 
 type DailyImage struct {
@@ -29,6 +30,15 @@ type DailyImage struct {
 	Width      int32     `json:"width"`
 	Height     int32     `json:"height"`
 	IsActive   bool      `json:"is_active"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type DailyImageSchedule struct {
+	Date       time.Time `json:"date"`
+	StorageKey string    `json:"storage_key"`
+	Width      int32     `json:"width"`
+	Height     int32     `json:"height"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

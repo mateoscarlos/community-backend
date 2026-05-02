@@ -22,6 +22,15 @@ func (q *Queries) DeactivateAllDailyImages(ctx context.Context) error {
 	return err
 }
 
+const deleteScheduledByDate = `-- name: DeleteScheduledByDate :exec
+DELETE FROM daily_image_schedule WHERE date = $1
+`
+
+func (q *Queries) DeleteScheduledByDate(ctx context.Context, date time.Time) error {
+	_, err := q.db.ExecContext(ctx, deleteScheduledByDate, date)
+	return err
+}
+
 const getActiveDailyImage = `-- name: GetActiveDailyImage :one
 SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
 FROM daily_images
@@ -89,6 +98,68 @@ func (q *Queries) GetDailyImageByID(ctx context.Context, id uuid.UUID) (DailyIma
 	return i, err
 }
 
+const getScheduledByDate = `-- name: GetScheduledByDate :one
+SELECT date, storage_key, width, height, created_at, updated_at
+FROM daily_image_schedule
+WHERE date = $1
+`
+
+func (q *Queries) GetScheduledByDate(ctx context.Context, date time.Time) (DailyImageSchedule, error) {
+	row := q.db.QueryRowContext(ctx, getScheduledByDate, date)
+	var i DailyImageSchedule
+	err := row.Scan(
+		&i.Date,
+		&i.StorageKey,
+		&i.Width,
+		&i.Height,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listScheduleRange = `-- name: ListScheduleRange :many
+SELECT date, storage_key, width, height, created_at, updated_at
+FROM daily_image_schedule
+WHERE date >= $1 AND date <= $2
+ORDER BY date ASC
+`
+
+type ListScheduleRangeParams struct {
+	Date   time.Time `json:"date"`
+	Date_2 time.Time `json:"date_2"`
+}
+
+func (q *Queries) ListScheduleRange(ctx context.Context, arg ListScheduleRangeParams) ([]DailyImageSchedule, error) {
+	rows, err := q.db.QueryContext(ctx, listScheduleRange, arg.Date, arg.Date_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DailyImageSchedule
+	for rows.Next() {
+		var i DailyImageSchedule
+		if err := rows.Scan(
+			&i.Date,
+			&i.StorageKey,
+			&i.Width,
+			&i.Height,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertDailyImage = `-- name: UpsertDailyImage :one
 INSERT INTO daily_images (date, storage_key, width, height, is_active)
 VALUES ($1, $2, $3, $4, true)
@@ -123,6 +194,43 @@ func (q *Queries) UpsertDailyImage(ctx context.Context, arg UpsertDailyImagePara
 		&i.Width,
 		&i.Height,
 		&i.IsActive,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const upsertScheduledImage = `-- name: UpsertScheduledImage :one
+INSERT INTO daily_image_schedule (date, storage_key, width, height)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (date) DO UPDATE
+    SET storage_key = EXCLUDED.storage_key,
+        width       = EXCLUDED.width,
+        height      = EXCLUDED.height,
+        updated_at  = now()
+RETURNING date, storage_key, width, height, created_at, updated_at
+`
+
+type UpsertScheduledImageParams struct {
+	Date       time.Time `json:"date"`
+	StorageKey string    `json:"storage_key"`
+	Width      int32     `json:"width"`
+	Height     int32     `json:"height"`
+}
+
+func (q *Queries) UpsertScheduledImage(ctx context.Context, arg UpsertScheduledImageParams) (DailyImageSchedule, error) {
+	row := q.db.QueryRowContext(ctx, upsertScheduledImage,
+		arg.Date,
+		arg.StorageKey,
+		arg.Width,
+		arg.Height,
+	)
+	var i DailyImageSchedule
+	err := row.Scan(
+		&i.Date,
+		&i.StorageKey,
+		&i.Width,
+		&i.Height,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

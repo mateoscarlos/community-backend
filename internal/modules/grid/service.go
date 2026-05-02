@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/community-app/community-backend/internal/modules/dailyimage"
 	"github.com/community-app/community-backend/internal/shared/composer"
 	"github.com/community-app/community-backend/internal/shared/storage"
 	"github.com/google/uuid"
@@ -71,13 +72,14 @@ func isPastDailyCutoff(startedAt, now time.Time) bool {
 }
 
 type Service struct {
-	repo  Repository
-	store *storage.Storage
-	log   zerolog.Logger
+	repo    Repository
+	imgRepo dailyimage.Repository
+	store   *storage.Storage
+	log     zerolog.Logger
 }
 
-func NewService(repo Repository, store *storage.Storage, log zerolog.Logger) *Service {
-	return &Service{repo: repo, store: store, log: log}
+func NewService(repo Repository, imgRepo dailyimage.Repository, store *storage.Storage, log zerolog.Logger) *Service {
+	return &Service{repo: repo, imgRepo: imgRepo, store: store, log: log}
 }
 
 type CurrentPeriod struct {
@@ -295,40 +297,93 @@ func (s *Service) ListMosaics(ctx context.Context, periodID uuid.UUID) ([]PhaseM
 }
 
 // SweepExpiredPeriod closes the active period if it's past its daily cutoff
-// (midnight in PeriodTimezone). Composes a final mosaic for the current phase
-// when at least one tile has been drawn. Safe to call when there's no active
-// period — returns nil. Designed for a background sweeper.
+// (midnight in PeriodTimezone), composes a final mosaic for whatever phase
+// was in flight, then auto-rotates by promoting today's scheduled image and
+// spawning a fresh active period. Each step's failure is logged but doesn't
+// block the others. Safe to call with no active period — returns nil.
 func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
 	p, err := s.repo.GetActivePeriod(ctx)
-	if err != nil {
-		if errors.Is(err, ErrPeriodNotFound) {
+	if err == nil {
+		if !isPastDailyCutoff(p.StartedAt, time.Now()) {
 			return nil
 		}
+
+		if cErr := s.repo.CompletePeriod(ctx, p.ID); cErr != nil {
+			return fmt.Errorf("sweep period: complete: %w", cErr)
+		}
+
+		drawn, total, cntErr := s.repo.CountTilesByStatus(ctx, p.ID, p.Phase)
+		if cntErr != nil {
+			s.log.Warn().Err(cntErr).Msg("sweep period: count tiles")
+		} else if drawn > 0 {
+			if cErr := s.ComposeFinalImage(ctx, p.ID, p.Phase); cErr != nil {
+				s.log.Error().Err(cErr).Msg("sweep period: compose")
+			}
+		}
+
+		s.log.Info().
+			Str("period_id", p.ID.String()).
+			Int64("drawn", drawn).
+			Int64("total", total).
+			Int("phase", p.Phase).
+			Msg("swept past-cutoff period")
+	} else if !errors.Is(err, ErrPeriodNotFound) {
 		return fmt.Errorf("sweep period: get active: %w", err)
 	}
-	if !isPastDailyCutoff(p.StartedAt, time.Now()) {
-		return nil
-	}
 
-	if err := s.repo.CompletePeriod(ctx, p.ID); err != nil {
-		return fmt.Errorf("sweep period: complete: %w", err)
+	// Try to spawn a new period for today using the schedule. Always attempted,
+	// whether we just closed one or there was no active period (e.g. backend
+	// restarted past midnight). Errors are logged, not returned — the sweeper
+	// will retry on the next tick.
+	if err := s.rotateForToday(ctx); err != nil {
+		s.log.Warn().Err(err).Msg("sweep period: auto-rotate skipped")
 	}
+	return nil
+}
 
-	drawn, total, err := s.repo.CountTilesByStatus(ctx, p.ID, p.Phase)
+// rotateForToday promotes the scheduled image for the current Cph date and
+// creates an active period from it. No-op if a period for today already exists
+// or no image is scheduled.
+func (s *Service) rotateForToday(ctx context.Context) error {
+	loc, err := time.LoadLocation(PeriodTimezone)
 	if err != nil {
-		s.log.Warn().Err(err).Msg("sweep period: count tiles")
-	} else if drawn > 0 {
-		if cErr := s.ComposeFinalImage(ctx, p.ID, p.Phase); cErr != nil {
-			s.log.Error().Err(cErr).Msg("sweep period: compose")
+		return fmt.Errorf("load tz: %w", err)
+	}
+	now := time.Now().In(loc)
+	y, m, d := now.Date()
+	today := time.Date(y, m, d, 0, 0, 0, 0, loc)
+
+	// Don't double-spawn — if there's already an active period for today, bail.
+	if existing, err := s.repo.GetActivePeriod(ctx); err == nil {
+		startedLocal := existing.StartedAt.In(loc)
+		ey, em, ed := startedLocal.Date()
+		if ey == y && em == m && ed == d {
+			return nil
 		}
+	}
+
+	scheduled, err := s.imgRepo.GetScheduledByDate(ctx, today)
+	if err != nil {
+		if errors.Is(err, dailyimage.ErrNotFound) {
+			return fmt.Errorf("no scheduled image for %s", today.Format("2006-01-02"))
+		}
+		return fmt.Errorf("get scheduled: %w", err)
+	}
+
+	img, err := s.imgRepo.SetActive(ctx, today, scheduled.StorageKey, scheduled.Width, scheduled.Height)
+	if err != nil {
+		return fmt.Errorf("promote scheduled: %w", err)
+	}
+
+	period, err := s.CreatePeriodWithTiles(ctx, img.ID, "photo")
+	if err != nil {
+		return fmt.Errorf("create period: %w", err)
 	}
 
 	s.log.Info().
-		Str("period_id", p.ID.String()).
-		Int64("drawn", drawn).
-		Int64("total", total).
-		Int("phase", p.Phase).
-		Msg("swept past-cutoff period")
+		Str("period_id", period.ID.String()).
+		Str("date", today.Format("2006-01-02")).
+		Msg("auto-rotated to scheduled image")
 	return nil
 }
 
