@@ -26,6 +26,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Route("/api/v1/tiles/{id}", func(r chi.Router) {
 		r.Post("/claim", h.claimTile)
 		r.Delete("/claim", h.releaseClaim)
+		r.Post("/heartbeat", h.heartbeat)
+		r.Post("/extend", h.extend)
 	})
 }
 
@@ -107,4 +109,81 @@ type claimResponse struct {
 	ClaimID   string `json:"claim_id"`
 	TileID    string `json:"tile_id"`
 	ExpiresAt string `json:"expires_at"`
+}
+
+type expiresAtResponse struct {
+	TileID    string `json:"tile_id"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
+	tileID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid tile id")
+		return
+	}
+
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.SessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	expiresAt, err := h.svc.Heartbeat(r.Context(), tileID, body.SessionID)
+	if err != nil {
+		if errors.Is(err, ErrClaimNotFound) {
+			httpserver.WriteError(w, http.StatusNotFound, "claim not found")
+			return
+		}
+		h.log.Error().Err(err).Msg("heartbeat")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, expiresAtResponse{
+		TileID:    tileID.String(),
+		ExpiresAt: expiresAt.Format("2006-01-02T15:04:05Z07:00"),
+	})
+}
+
+func (h *Handler) extend(w http.ResponseWriter, r *http.Request) {
+	tileID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid tile id")
+		return
+	}
+
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.SessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	expiresAt, err := h.svc.Extend(r.Context(), tileID, body.SessionID)
+	if err != nil {
+		if errors.Is(err, ErrClaimNotFound) {
+			httpserver.WriteError(w, http.StatusNotFound, "claim not found")
+			return
+		}
+		h.log.Error().Err(err).Msg("extend")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, expiresAtResponse{
+		TileID:    tileID.String(),
+		ExpiresAt: expiresAt.Format("2006-01-02T15:04:05Z07:00"),
+	})
 }

@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/community-app/community-backend/internal/shared/composer"
 	"github.com/community-app/community-backend/internal/shared/storage"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -38,6 +40,12 @@ const (
 	// A period started during day D in this zone is over the moment it crosses
 	// midnight into D+1 (whichever phase it's currently on).
 	PeriodTimezone = "Europe/Copenhagen"
+
+	// composeFetchConcurrency caps in-flight tile downloads during compose.
+	// Object storage round-trips (R2/MinIO) dominate compose latency at high
+	// phase counts; pulling tiles in parallel turns hundreds of sequential
+	// 50ms RTTs into batches.
+	composeFetchConcurrency = 16
 )
 
 // ThumbnailKey returns the storage key for the thumbnail variant of a full
@@ -168,20 +176,49 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 		return fmt.Errorf("compose: get tiles: %w", err)
 	}
 
-	tileImgs := make([]composer.TileImage, 0, len(tiles))
-	for _, t := range tiles {
+	// Download tile bytes in parallel — biggest perf win for high-phase grids.
+	type fetched struct {
+		row, col int
+		data     []byte
+	}
+	results := make([]fetched, len(tiles))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(composeFetchConcurrency)
+	var failedMu sync.Mutex
+	failedKeys := make([]string, 0)
+	for i, t := range tiles {
 		if t.SubmissionKey == "" {
 			continue
 		}
-		data, err := s.store.GetObject(ctx, t.SubmissionKey)
-		if err != nil {
-			s.log.Warn().Err(err).Str("key", t.SubmissionKey).Msg("compose: skip tile, fetch failed")
+		i, t := i, t
+		g.Go(func() error {
+			data, err := s.store.GetObject(gctx, t.SubmissionKey)
+			if err != nil {
+				failedMu.Lock()
+				failedKeys = append(failedKeys, t.SubmissionKey)
+				failedMu.Unlock()
+				return nil // missing tile is non-fatal — leaves a black cell
+			}
+			results[i] = fetched{row: t.RowIndex, col: t.ColIndex, data: data}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("compose: parallel fetch: %w", err)
+	}
+	if len(failedKeys) > 0 {
+		s.log.Warn().Int("count", len(failedKeys)).Msg("compose: some tiles failed to fetch")
+	}
+
+	tileImgs := make([]composer.TileImage, 0, len(results))
+	for _, r := range results {
+		if r.data == nil {
 			continue
 		}
 		tileImgs = append(tileImgs, composer.TileImage{
-			Row:  t.RowIndex,
-			Col:  t.ColIndex,
-			Data: data,
+			Row:  r.row,
+			Col:  r.col,
+			Data: r.data,
 		})
 	}
 

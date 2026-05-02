@@ -28,6 +28,14 @@ type Repository interface {
 	GetClaimByTileID(ctx context.Context, tileID uuid.UUID) (*Claim, error)
 	GetActiveClaimBySessionAndTile(ctx context.Context, tileID uuid.UUID, sessionID string) (*Claim, error)
 	HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error)
+
+	// HeartbeatClaim refreshes last_heartbeat_at and returns expires_at.
+	// Returns ErrClaimNotFound if no active claim matches.
+	HeartbeatClaim(ctx context.Context, tileID uuid.UUID, sessionID string) (time.Time, error)
+
+	// ExtendClaim pushes expires_at forward by extraSeconds, capped at
+	// claimed_at + maxTotalSeconds. Returns the new expires_at.
+	ExtendClaim(ctx context.Context, tileID uuid.UUID, sessionID string, extraSeconds, maxTotalSeconds int) (time.Time, error)
 }
 
 type postgresRepository struct {
@@ -122,6 +130,38 @@ func (r *postgresRepository) GetActiveClaimBySessionAndTile(ctx context.Context,
 		return nil, fmt.Errorf("get claim by session and tile: %w", err)
 	}
 	return toDomain(row), nil
+}
+
+func (r *postgresRepository) HeartbeatClaim(ctx context.Context, tileID uuid.UUID, sessionID string) (time.Time, error) {
+	var claimID uuid.UUID
+	var expiresAt time.Time
+	err := r.db.QueryRowContext(ctx,
+		`SELECT claim_id, expires_at FROM heartbeat_claim($1, $2)`,
+		tileID, sessionID,
+	).Scan(&claimID, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, ErrClaimNotFound
+		}
+		return time.Time{}, fmt.Errorf("heartbeat claim: %w", err)
+	}
+	return expiresAt, nil
+}
+
+func (r *postgresRepository) ExtendClaim(ctx context.Context, tileID uuid.UUID, sessionID string, extraSeconds, maxTotalSeconds int) (time.Time, error) {
+	var claimID uuid.UUID
+	var expiresAt time.Time
+	err := r.db.QueryRowContext(ctx,
+		`SELECT claim_id, expires_at FROM extend_claim($1, $2, $3, $4)`,
+		tileID, sessionID, extraSeconds, maxTotalSeconds,
+	).Scan(&claimID, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, ErrClaimNotFound
+		}
+		return time.Time{}, fmt.Errorf("extend claim: %w", err)
+	}
+	return expiresAt, nil
 }
 
 func (r *postgresRepository) HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error) {

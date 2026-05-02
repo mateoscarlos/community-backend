@@ -19,9 +19,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
-const uploadURLExpiry = 30 * time.Minute
+const (
+	uploadURLExpiry          = 30 * time.Minute
+	drawAllUploadConcurrency = 16
+)
 
 // Handler exposes debug-only endpoints. Never registered in production.
 type Handler struct {
@@ -373,22 +377,29 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upload a colored placeholder per tile. Done before the DB transaction
-	// because object storage is not transactional; orphans on tx-rollback are
-	// acceptable for a debug endpoint.
+	// Upload a colored placeholder per tile in parallel. Done before the DB
+	// transaction because object storage is not transactional; orphans on
+	// tx-rollback are acceptable for a debug endpoint.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(drawAllUploadConcurrency)
 	for _, t := range tiles {
-		jpg, err := makePlaceholderJPEG(t.row, t.col)
-		if err != nil {
-			h.log.Error().Err(err).Msg("draw-all: encode placeholder")
-			httpserver.WriteError(w, http.StatusInternalServerError, "encode placeholder failed")
-			return
-		}
-		key := fmt.Sprintf("tiles/%s.jpg", t.id.String())
-		if err := h.store.PutObject(ctx, key, jpg, "image/jpeg"); err != nil {
-			h.log.Error().Err(err).Str("key", key).Msg("draw-all: upload placeholder")
-			httpserver.WriteError(w, http.StatusInternalServerError, "upload placeholder failed")
-			return
-		}
+		t := t
+		g.Go(func() error {
+			jpg, err := makePlaceholderJPEG(t.row, t.col)
+			if err != nil {
+				return fmt.Errorf("encode placeholder: %w", err)
+			}
+			key := fmt.Sprintf("tiles/%s.jpg", t.id.String())
+			if err := h.store.PutObject(gctx, key, jpg, "image/jpeg"); err != nil {
+				return fmt.Errorf("upload %s: %w", key, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		h.log.Error().Err(err).Msg("draw-all: parallel upload")
+		httpserver.WriteError(w, http.StatusInternalServerError, "upload placeholders failed")
+		return
 	}
 
 	tx, err := h.db.BeginTx(ctx, nil)

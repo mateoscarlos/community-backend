@@ -10,7 +10,17 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const DefaultClaimTTL = 30 * time.Minute
+const (
+	// DefaultClaimTTL is the initial time the user has to draw their tile.
+	DefaultClaimTTL = 10 * time.Minute
+
+	// ExtendClaimDuration is how much time "Need 2 more minutes" buys.
+	ExtendClaimDuration = 2 * time.Minute
+
+	// MaxClaimTotalDuration caps the total time a single claim can occupy a
+	// tile, even with repeated extensions. Prevents indefinite hogging.
+	MaxClaimTotalDuration = 30 * time.Minute
+)
 
 type Service struct {
 	repo   Repository
@@ -62,6 +72,33 @@ func (s *Service) ReleaseClaim(ctx context.Context, tileID uuid.UUID, sessionID 
 	s.broker.PublishTileEvent(sse.EventTileFreed, tileID.String(), "free")
 
 	return nil
+}
+
+// Heartbeat refreshes the claim's liveness timestamp. Returns the (unchanged)
+// expires_at so the client can keep its countdown in sync. ErrClaimNotFound
+// if the claim doesn't exist or doesn't belong to this session.
+func (s *Service) Heartbeat(ctx context.Context, tileID uuid.UUID, sessionID string) (time.Time, error) {
+	expiresAt, err := s.repo.HeartbeatClaim(ctx, tileID, sessionID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("claim service: heartbeat: %w", err)
+	}
+	return expiresAt, nil
+}
+
+// Extend pushes expires_at forward by ExtendClaimDuration, bounded by
+// MaxClaimTotalDuration from claimed_at. Returns the new expires_at.
+func (s *Service) Extend(ctx context.Context, tileID uuid.UUID, sessionID string) (time.Time, error) {
+	expiresAt, err := s.repo.ExtendClaim(ctx, tileID, sessionID,
+		int(ExtendClaimDuration.Seconds()),
+		int(MaxClaimTotalDuration.Seconds()))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("claim service: extend: %w", err)
+	}
+	s.log.Info().
+		Str("tile_id", tileID.String()).
+		Time("expires_at", expiresAt).
+		Msg("claim extended")
+	return expiresAt, nil
 }
 
 // SweepExpired atomically releases all expired claims and frees their tiles.
