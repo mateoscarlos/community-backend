@@ -7,6 +7,7 @@ package composer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
@@ -48,6 +49,10 @@ func Compose(opts Options, tiles []TileImage) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("composer: decode tile [%d,%d]: %w", t.Row, t.Col, err)
 		}
+		// Phone JPEGs typically encode pixels in sensor orientation and rely on
+		// an EXIF tag for display rotation. Apply it before cropping/scaling so
+		// the mosaic shows tiles upright.
+		img = applyExifOrientation(img, readExifOrientation(t.Data))
 		cropped := centerCropSquare(img)
 		scaled := scaleBox(cropped, opts.CellSize, opts.CellSize)
 		dstX := t.Col * opts.CellSize
@@ -163,6 +168,169 @@ func scaleBox(src image.Image, dstW, dstH int) *image.RGBA {
 				B: uint8(sumB / count),
 				A: uint8(sumA / count),
 			})
+		}
+	}
+	return dst
+}
+
+// readExifOrientation pulls the EXIF Orientation tag (TIFF tag 0x0112) from a
+// JPEG byte stream. Returns 1 (no transform) when EXIF is missing/unreadable.
+//
+// JPEG layout: SOI (FFD8) followed by markers; EXIF lives in the APP1 marker
+// (FFE1) prefixed with "Exif\0\0", then a TIFF header + IFD0.
+func readExifOrientation(jpegData []byte) int {
+	if len(jpegData) < 4 || jpegData[0] != 0xFF || jpegData[1] != 0xD8 {
+		return 1
+	}
+	i := 2
+	for i+4 <= len(jpegData) {
+		if jpegData[i] != 0xFF {
+			return 1
+		}
+		marker := jpegData[i+1]
+		// SOS (0xDA) — image data starts; stop scanning.
+		// EOI (0xD9), or an RSTn (D0..D7) — no length field.
+		if marker == 0xDA || marker == 0xD9 {
+			return 1
+		}
+		if marker >= 0xD0 && marker <= 0xD7 {
+			i += 2
+			continue
+		}
+		segLen := int(jpegData[i+2])<<8 | int(jpegData[i+3])
+		if segLen < 2 || i+2+segLen > len(jpegData) {
+			return 1
+		}
+		if marker == 0xE1 && segLen >= 8 {
+			seg := jpegData[i+4 : i+2+segLen]
+			if len(seg) >= 6 && string(seg[0:6]) == "Exif\x00\x00" {
+				if o := parseTIFFOrientation(seg[6:]); o > 0 {
+					return o
+				}
+				return 1
+			}
+		}
+		i += 2 + segLen
+	}
+	return 1
+}
+
+func parseTIFFOrientation(tiff []byte) int {
+	if len(tiff) < 8 {
+		return 0
+	}
+	var bo binary.ByteOrder
+	switch string(tiff[0:2]) {
+	case "II":
+		bo = binary.LittleEndian
+	case "MM":
+		bo = binary.BigEndian
+	default:
+		return 0
+	}
+	if bo.Uint16(tiff[2:4]) != 0x002A {
+		return 0
+	}
+	ifdOffset := int(bo.Uint32(tiff[4:8]))
+	if ifdOffset+2 > len(tiff) {
+		return 0
+	}
+	n := int(bo.Uint16(tiff[ifdOffset:]))
+	base := ifdOffset + 2
+	for k := 0; k < n; k++ {
+		entry := base + k*12
+		if entry+12 > len(tiff) {
+			return 0
+		}
+		tag := bo.Uint16(tiff[entry:])
+		if tag == 0x0112 {
+			// SHORT (type 3), count 1 — the value sits in the first 2 bytes
+			// of the 4-byte value/offset field.
+			return int(bo.Uint16(tiff[entry+8:]))
+		}
+	}
+	return 0
+}
+
+// applyExifOrientation rotates/mirrors `img` per the EXIF orientation value
+// (1..8). Returns img unchanged for orientation 1 (default) or unrecognized
+// values. Operates in pure RGBA copies — no external scaler dependency.
+func applyExifOrientation(img image.Image, orientation int) image.Image {
+	switch orientation {
+	case 2:
+		return flipHorizontal(img)
+	case 3:
+		return rotate180(img)
+	case 4:
+		return flipVertical(img)
+	case 5:
+		return rotate90CW(flipHorizontal(img))
+	case 6:
+		return rotate90CW(img)
+	case 7:
+		return rotate90CCW(flipHorizontal(img))
+	case 8:
+		return rotate90CCW(img)
+	default:
+		return img
+	}
+}
+
+func rotate90CW(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, h, w))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(h-1-y, x, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+func rotate90CCW(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, h, w))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(y, w-1-x, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+func rotate180(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(w-1-x, h-1-y, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+func flipHorizontal(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(w-1-x, y, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+func flipVertical(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(x, h-1-y, src.At(b.Min.X+x, b.Min.Y+y))
 		}
 	}
 	return dst
