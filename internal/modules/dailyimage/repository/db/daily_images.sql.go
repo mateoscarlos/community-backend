@@ -31,6 +31,15 @@ func (q *Queries) DeleteScheduledByDate(ctx context.Context, date time.Time) err
 	return err
 }
 
+const deleteScheduledPromptByDate = `-- name: DeleteScheduledPromptByDate :exec
+DELETE FROM daily_prompt_schedule WHERE date = $1
+`
+
+func (q *Queries) DeleteScheduledPromptByDate(ctx context.Context, date time.Time) error {
+	_, err := q.db.ExecContext(ctx, deleteScheduledPromptByDate, date)
+	return err
+}
+
 const getActiveDailyImage = `-- name: GetActiveDailyImage :one
 SELECT id, date, storage_key, width, height, is_active, created_at, updated_at
 FROM daily_images
@@ -116,6 +125,64 @@ func (q *Queries) GetScheduledByDate(ctx context.Context, date time.Time) (Daily
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getScheduledPromptByDate = `-- name: GetScheduledPromptByDate :one
+SELECT date, prompt, created_at, updated_at
+FROM daily_prompt_schedule
+WHERE date = $1
+`
+
+func (q *Queries) GetScheduledPromptByDate(ctx context.Context, date time.Time) (DailyPromptSchedule, error) {
+	row := q.db.QueryRowContext(ctx, getScheduledPromptByDate, date)
+	var i DailyPromptSchedule
+	err := row.Scan(
+		&i.Date,
+		&i.Prompt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listPromptScheduleRange = `-- name: ListPromptScheduleRange :many
+SELECT date, prompt, created_at, updated_at
+FROM daily_prompt_schedule
+WHERE date >= $1 AND date <= $2
+ORDER BY date ASC
+`
+
+type ListPromptScheduleRangeParams struct {
+	Date   time.Time `json:"date"`
+	Date_2 time.Time `json:"date_2"`
+}
+
+func (q *Queries) ListPromptScheduleRange(ctx context.Context, arg ListPromptScheduleRangeParams) ([]DailyPromptSchedule, error) {
+	rows, err := q.db.QueryContext(ctx, listPromptScheduleRange, arg.Date, arg.Date_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DailyPromptSchedule
+	for rows.Next() {
+		var i DailyPromptSchedule
+		if err := rows.Scan(
+			&i.Date,
+			&i.Prompt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listScheduleRange = `-- name: ListScheduleRange :many
@@ -231,6 +298,34 @@ func (q *Queries) UpsertScheduledImage(ctx context.Context, arg UpsertScheduledI
 		&i.StorageKey,
 		&i.Width,
 		&i.Height,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const upsertScheduledPrompt = `-- name: UpsertScheduledPrompt :one
+
+INSERT INTO daily_prompt_schedule (date, prompt)
+VALUES ($1, $2)
+ON CONFLICT (date) DO UPDATE
+    SET prompt     = EXCLUDED.prompt,
+        updated_at = now()
+RETURNING date, prompt, created_at, updated_at
+`
+
+type UpsertScheduledPromptParams struct {
+	Date   time.Time `json:"date"`
+	Prompt string    `json:"prompt"`
+}
+
+// --- Prompt schedule (parallel "draw from a prompt" game) ---
+func (q *Queries) UpsertScheduledPrompt(ctx context.Context, arg UpsertScheduledPromptParams) (DailyPromptSchedule, error) {
+	row := q.db.QueryRowContext(ctx, upsertScheduledPrompt, arg.Date, arg.Prompt)
+	var i DailyPromptSchedule
+	err := row.Scan(
+		&i.Date,
+		&i.Prompt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

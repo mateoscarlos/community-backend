@@ -12,7 +12,12 @@ import (
 
 type Querier interface {
 	GetSubmissionByTileID(ctx context.Context, tileID uuid.UUID) (Submission, error)
+	// Submissions whose phase has been composed into a mosaic and whose backing
+	// R2/MinIO object hasn't been pruned yet. The sweeper deletes these objects
+	// and stamps storage_cleaned_at; the row stays for audit.
+	ListCleanupCandidates(ctx context.Context, limit int32) ([]ListCleanupCandidatesRow, error)
 	ListSubmissionsByPeriodAndPhase(ctx context.Context, arg ListSubmissionsByPeriodAndPhaseParams) ([]Submission, error)
+	MarkSubmissionsCleaned(ctx context.Context, ids []uuid.UUID) error
 }
 
 var _ Querier = (*Queries)(nil)

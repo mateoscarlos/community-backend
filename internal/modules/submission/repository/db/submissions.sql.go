@@ -9,10 +9,12 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 const getSubmissionByTileID = `-- name: GetSubmissionByTileID :one
-SELECT id, tile_id, claim_id, storage_key, crop_x, crop_y, crop_width, crop_height, created_at
+SELECT id, tile_id, claim_id, storage_key, crop_x, crop_y, crop_width,
+       crop_height, created_at, storage_cleaned_at
 FROM submissions
 WHERE tile_id = $1
 `
@@ -30,13 +32,55 @@ func (q *Queries) GetSubmissionByTileID(ctx context.Context, tileID uuid.UUID) (
 		&i.CropWidth,
 		&i.CropHeight,
 		&i.CreatedAt,
+		&i.StorageCleanedAt,
 	)
 	return i, err
 }
 
+const listCleanupCandidates = `-- name: ListCleanupCandidates :many
+SELECT s.id, s.storage_key
+FROM submissions s
+JOIN tiles t           ON t.id = s.tile_id
+JOIN period_mosaics pm ON pm.period_id = t.period_id AND pm.phase = t.phase
+WHERE s.storage_cleaned_at IS NULL
+LIMIT $1
+`
+
+type ListCleanupCandidatesRow struct {
+	ID         uuid.UUID `json:"id"`
+	StorageKey string    `json:"storage_key"`
+}
+
+// Submissions whose phase has been composed into a mosaic and whose backing
+// R2/MinIO object hasn't been pruned yet. The sweeper deletes these objects
+// and stamps storage_cleaned_at; the row stays for audit.
+func (q *Queries) ListCleanupCandidates(ctx context.Context, limit int32) ([]ListCleanupCandidatesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCleanupCandidates, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCleanupCandidatesRow
+	for rows.Next() {
+		var i ListCleanupCandidatesRow
+		if err := rows.Scan(&i.ID, &i.StorageKey); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSubmissionsByPeriodAndPhase = `-- name: ListSubmissionsByPeriodAndPhase :many
 SELECT s.id, s.tile_id, s.claim_id, s.storage_key,
-       s.crop_x, s.crop_y, s.crop_width, s.crop_height, s.created_at
+       s.crop_x, s.crop_y, s.crop_width, s.crop_height,
+       s.created_at, s.storage_cleaned_at
 FROM submissions s
 JOIN tiles t ON t.id = s.tile_id
 WHERE t.period_id = $1 AND t.phase = $2
@@ -66,6 +110,7 @@ func (q *Queries) ListSubmissionsByPeriodAndPhase(ctx context.Context, arg ListS
 			&i.CropWidth,
 			&i.CropHeight,
 			&i.CreatedAt,
+			&i.StorageCleanedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -78,4 +123,15 @@ func (q *Queries) ListSubmissionsByPeriodAndPhase(ctx context.Context, arg ListS
 		return nil, err
 	}
 	return items, nil
+}
+
+const markSubmissionsCleaned = `-- name: MarkSubmissionsCleaned :exec
+UPDATE submissions
+SET storage_cleaned_at = now()
+WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) MarkSubmissionsCleaned(ctx context.Context, ids []uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, markSubmissionsCleaned, pq.Array(ids))
+	return err
 }

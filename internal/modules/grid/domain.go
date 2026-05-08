@@ -22,9 +22,21 @@ const (
 	PeriodArchived  PeriodStatus = "archived"
 )
 
+// GameType discriminates between the two parallel games:
+//   - photo: users copy a daily image, tile by tile (the original game).
+//   - prompt: users free-draw on an empty canvas from a text prompt.
+type GameType string
+
+const (
+	GamePhoto  GameType = "photo"
+	GamePrompt GameType = "prompt"
+)
+
+func (g GameType) Valid() bool { return g == GamePhoto || g == GamePrompt }
+
 type Period struct {
 	ID            uuid.UUID
-	DailyImageID  uuid.UUID
+	DailyImageID  *uuid.UUID // nil for prompt-game periods
 	GameType      string
 	Status        PeriodStatus
 	Phase         int
@@ -32,6 +44,7 @@ type Period struct {
 	EndedAt       *time.Time
 	FinalImageKey string // empty if not yet composed
 	ComposedAt    *time.Time
+	Prompt        string // empty for photo-game periods
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }

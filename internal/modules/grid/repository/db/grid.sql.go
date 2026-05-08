@@ -48,16 +48,17 @@ func (q *Queries) CountTilesByStatus(ctx context.Context, arg CountTilesByStatus
 }
 
 const createPeriod = `-- name: CreatePeriod :one
-INSERT INTO periods (daily_image_id, game_type, status, phase)
-VALUES ($1, $2, $3, $4)
-RETURNING id, daily_image_id, game_type, status, phase, started_at, ended_at, created_at, updated_at, final_image_key, composed_at
+INSERT INTO periods (daily_image_id, game_type, status, phase, prompt)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, daily_image_id, game_type, status, phase, started_at, ended_at, created_at, updated_at, final_image_key, composed_at, prompt
 `
 
 type CreatePeriodParams struct {
-	DailyImageID uuid.UUID `json:"daily_image_id"`
-	GameType     string    `json:"game_type"`
-	Status       string    `json:"status"`
-	Phase        int32     `json:"phase"`
+	DailyImageID uuid.NullUUID  `json:"daily_image_id"`
+	GameType     string         `json:"game_type"`
+	Status       string         `json:"status"`
+	Phase        int32          `json:"phase"`
+	Prompt       sql.NullString `json:"prompt"`
 }
 
 func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Period, error) {
@@ -66,6 +67,7 @@ func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Per
 		arg.GameType,
 		arg.Status,
 		arg.Phase,
+		arg.Prompt,
 	)
 	var i Period
 	err := row.Scan(
@@ -80,6 +82,7 @@ func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Per
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
+		&i.Prompt,
 	)
 	return i, err
 }
@@ -121,14 +124,14 @@ func (q *Queries) CreateTile(ctx context.Context, arg CreateTileParams) (Tile, e
 const getActivePeriod = `-- name: GetActivePeriod :one
 SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
        p.started_at, p.ended_at, p.created_at, p.updated_at,
-       p.final_image_key, p.composed_at
+       p.final_image_key, p.composed_at, p.prompt
 FROM periods p
-WHERE p.status = 'active'
+WHERE p.status = 'active' AND p.game_type = $1
 LIMIT 1
 `
 
-func (q *Queries) GetActivePeriod(ctx context.Context) (Period, error) {
-	row := q.db.QueryRowContext(ctx, getActivePeriod)
+func (q *Queries) GetActivePeriod(ctx context.Context, gameType string) (Period, error) {
+	row := q.db.QueryRowContext(ctx, getActivePeriod, gameType)
 	var i Period
 	err := row.Scan(
 		&i.ID,
@@ -142,6 +145,7 @@ func (q *Queries) GetActivePeriod(ctx context.Context) (Period, error) {
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
+		&i.Prompt,
 	)
 	return i, err
 }
@@ -168,7 +172,7 @@ func (q *Queries) GetGridConfig(ctx context.Context, phase int32) (GridConfig, e
 const getPeriodByID = `-- name: GetPeriodByID :one
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE id = $1
 `
@@ -188,6 +192,37 @@ func (q *Queries) GetPeriodByID(ctx context.Context, id uuid.UUID) (Period, erro
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
+		&i.Prompt,
+	)
+	return i, err
+}
+
+const getPeriodByTileID = `-- name: GetPeriodByTileID :one
+SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
+       p.started_at, p.ended_at, p.created_at, p.updated_at,
+       p.final_image_key, p.composed_at, p.prompt
+FROM periods p
+JOIN tiles t ON t.period_id = p.id
+WHERE t.id = $1
+LIMIT 1
+`
+
+func (q *Queries) GetPeriodByTileID(ctx context.Context, id uuid.UUID) (Period, error) {
+	row := q.db.QueryRowContext(ctx, getPeriodByTileID, id)
+	var i Period
+	err := row.Scan(
+		&i.ID,
+		&i.DailyImageID,
+		&i.GameType,
+		&i.Status,
+		&i.Phase,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinalImageKey,
+		&i.ComposedAt,
+		&i.Prompt,
 	)
 	return i, err
 }
@@ -255,22 +290,25 @@ func (q *Queries) GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPe
 const listCompletedPeriods = `-- name: ListCompletedPeriods :many
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE final_image_key IS NOT NULL
+  AND game_type = $1
 ORDER BY started_at DESC
-LIMIT $1 OFFSET $2
+LIMIT $2 OFFSET $3
 `
 
 type ListCompletedPeriodsParams struct {
-	Limit  int32 `json:"limit"`
-	Offset int32 `json:"offset"`
+	GameType string `json:"game_type"`
+	Limit    int32  `json:"limit"`
+	Offset   int32  `json:"offset"`
 }
 
-// Lists periods that have a composed mosaic. Includes both completed and
-// still-active periods, so today's in-progress mosaic appears in the archive.
+// Lists periods of a single game (photo or prompt) that have a composed
+// mosaic. Includes both completed and still-active periods, so today's
+// in-progress mosaic appears in the archive.
 func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPeriodsParams) ([]Period, error) {
-	rows, err := q.db.QueryContext(ctx, listCompletedPeriods, arg.Limit, arg.Offset)
+	rows, err := q.db.QueryContext(ctx, listCompletedPeriods, arg.GameType, arg.Limit, arg.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +328,7 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 			&i.UpdatedAt,
 			&i.FinalImageKey,
 			&i.ComposedAt,
+			&i.Prompt,
 		); err != nil {
 			return nil, err
 		}
@@ -307,7 +346,7 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 const listCompletedPeriodsMissingFinalImage = `-- name: ListCompletedPeriodsMissingFinalImage :many
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE status = 'completed' AND final_image_key IS NULL
 ORDER BY ended_at DESC
@@ -334,6 +373,7 @@ func (q *Queries) ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]
 			&i.UpdatedAt,
 			&i.FinalImageKey,
 			&i.ComposedAt,
+			&i.Prompt,
 		); err != nil {
 			return nil, err
 		}

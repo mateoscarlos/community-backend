@@ -122,3 +122,59 @@ func (s *Storage) PutObject(ctx context.Context, key string, data []byte, conten
 	}
 	return nil
 }
+
+// DeleteObject removes a single object. Idempotent: a missing object is not
+// treated as an error so callers can safely re-run cleanups.
+func (s *Storage) DeleteObject(ctx context.Context, key string) error {
+	if err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+	return nil
+}
+
+// DeleteObjects removes many objects in a single round-trip per batch (1000
+// per request — the S3/R2 limit). Returns the keys that were successfully
+// removed and the first error encountered, if any. Removes are idempotent on
+// the storage side; missing keys do not generate errors.
+func (s *Storage) DeleteObjects(ctx context.Context, keys []string) ([]string, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	const maxBatch = 1000
+	removed := make([]string, 0, len(keys))
+	var firstErr error
+
+	for start := 0; start < len(keys); start += maxBatch {
+		end := start + maxBatch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[start:end]
+
+		objCh := make(chan minio.ObjectInfo, len(batch))
+		go func() {
+			defer close(objCh)
+			for _, k := range batch {
+				objCh <- minio.ObjectInfo{Key: k}
+			}
+		}()
+
+		errCh := s.client.RemoveObjects(ctx, s.bucket, objCh, minio.RemoveObjectsOptions{})
+		failed := make(map[string]struct{}, 4)
+		for e := range errCh {
+			if firstErr == nil && e.Err != nil {
+				firstErr = fmt.Errorf("delete %q: %w", e.ObjectName, e.Err)
+			}
+			if e.Err != nil {
+				failed[e.ObjectName] = struct{}{}
+			}
+		}
+		for _, k := range batch {
+			if _, bad := failed[k]; !bad {
+				removed = append(removed, k)
+			}
+		}
+	}
+	return removed, firstErr
+}

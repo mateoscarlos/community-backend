@@ -34,9 +34,11 @@ func NewService(repo Repository, broker *sse.Broker, log zerolog.Logger) *Servic
 
 // ClaimTile atomically locks a free tile for the given session.
 // Safe under concurrent access: only one caller wins, the rest get ErrAlreadyClaimed.
-// A session may only hold one active claim at a time.
+// A session may hold at most one active claim *per game type* — so a user can
+// be drawing in the photo and prompt games at the same time, but not on two
+// tiles in the same game.
 func (s *Service) ClaimTile(ctx context.Context, tileID uuid.UUID, nickname, sessionID string) (*Claim, error) {
-	hasClaim, err := s.repo.HasActiveClaimForSession(ctx, sessionID)
+	hasClaim, err := s.repo.HasActiveClaimForSessionInGameOfTile(ctx, sessionID, tileID)
 	if err != nil {
 		return nil, fmt.Errorf("claim service: check active: %w", err)
 	}

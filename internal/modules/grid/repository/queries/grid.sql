@@ -1,40 +1,51 @@
 -- name: GetActivePeriod :one
 SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
        p.started_at, p.ended_at, p.created_at, p.updated_at,
-       p.final_image_key, p.composed_at
+       p.final_image_key, p.composed_at, p.prompt
 FROM periods p
-WHERE p.status = 'active'
+WHERE p.status = 'active' AND p.game_type = $1
 LIMIT 1;
 
 -- name: GetPeriodByID :one
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE id = $1;
 
+-- name: GetPeriodByTileID :one
+SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
+       p.started_at, p.ended_at, p.created_at, p.updated_at,
+       p.final_image_key, p.composed_at, p.prompt
+FROM periods p
+JOIN tiles t ON t.period_id = p.id
+WHERE t.id = $1
+LIMIT 1;
+
 -- name: ListCompletedPeriods :many
--- Lists periods that have a composed mosaic. Includes both completed and
--- still-active periods, so today's in-progress mosaic appears in the archive.
+-- Lists periods of a single game (photo or prompt) that have a composed
+-- mosaic. Includes both completed and still-active periods, so today's
+-- in-progress mosaic appears in the archive.
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE final_image_key IS NOT NULL
+  AND game_type = $1
 ORDER BY started_at DESC
-LIMIT $1 OFFSET $2;
+LIMIT $2 OFFSET $3;
 
 -- name: ListCompletedPeriodsMissingFinalImage :many
 SELECT id, daily_image_id, game_type, status, phase,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at
+       final_image_key, composed_at, prompt
 FROM periods
 WHERE status = 'completed' AND final_image_key IS NULL
 ORDER BY ended_at DESC;
 
 -- name: CreatePeriod :one
-INSERT INTO periods (daily_image_id, game_type, status, phase)
-VALUES ($1, $2, $3, $4)
+INSERT INTO periods (daily_image_id, game_type, status, phase, prompt)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: UpdatePeriodPhase :exec

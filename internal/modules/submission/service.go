@@ -46,6 +46,58 @@ func (s *Service) Presign(ctx context.Context, tileID uuid.UUID, contentType str
 	return uploadURL, storageKey, nil
 }
 
+// CleanupBatchSize caps how many R2 objects we attempt to delete per sweep
+// tick. Picked so a worst-case backlog clears within a few ticks without
+// blocking other work for too long. Below the 1000-key R2 batch limit so
+// each sweep makes at most one round-trip.
+const CleanupBatchSize = 500
+
+// CleanupOrphanedTileObjects deletes R2/MinIO objects for tile submissions
+// whose phase has already been composed into a mosaic — at that point the
+// individual JPGs are no longer needed for display or recompose. The DB rows
+// stay for audit; only the backing object is dropped, and the row is
+// stamped so we don't re-attempt the delete next tick.
+//
+// Returns the number of objects pruned this call.
+func (s *Service) CleanupOrphanedTileObjects(ctx context.Context) (int, error) {
+	candidates, err := s.repo.ListCleanupCandidates(ctx, CleanupBatchSize)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup: list candidates: %w", err)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	keys := make([]string, len(candidates))
+	keyToID := make(map[string]uuid.UUID, len(candidates))
+	for i, c := range candidates {
+		keys[i] = c.StorageKey
+		keyToID[c.StorageKey] = c.ID
+	}
+
+	removedKeys, delErr := s.store.DeleteObjects(ctx, keys)
+	if delErr != nil {
+		s.log.Warn().Err(delErr).Int("attempted", len(keys)).Msg("cleanup: some deletes failed")
+	}
+
+	cleanedIDs := make([]uuid.UUID, 0, len(removedKeys))
+	for _, k := range removedKeys {
+		if id, ok := keyToID[k]; ok {
+			cleanedIDs = append(cleanedIDs, id)
+		}
+	}
+	if err := s.repo.MarkCleaned(ctx, cleanedIDs); err != nil {
+		return 0, fmt.Errorf("cleanup: mark cleaned: %w", err)
+	}
+
+	s.log.Info().
+		Int("pruned", len(cleanedIDs)).
+		Int("attempted", len(keys)).
+		Msg("storage cleanup")
+
+	return len(cleanedIDs), nil
+}
+
 // Submit atomically creates a submission, marks the tile as drawn, and releases
 // the claim. Then checks if the phase is now complete.
 func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, storageKey string, crop Crop) (*Submission, error) {
@@ -64,8 +116,9 @@ func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, stora
 	s.broker.PublishTileEventWithImage(sse.EventTileDrawn, tileID.String(), "drawn", imgURL)
 
 	// Check if this completes the phase. Errors are logged, not propagated —
-	// the submission itself already succeeded.
-	period, err := s.gridSvc.GetActivePeriod(ctx)
+	// the submission itself already succeeded. Look up the period via the
+	// tile so we apply phase logic to the correct game (photo vs prompt).
+	period, err := s.gridSvc.GetPeriodByTileID(ctx, tileID)
 	if err == nil {
 		result, err := s.gridSvc.CheckPhaseCompletion(ctx, period.ID)
 		if err != nil {
@@ -73,9 +126,9 @@ func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, stora
 		} else {
 			switch result {
 			case grid.PhaseAdvanced:
-				s.broker.PublishPhaseComplete(period.Phase, period.Phase+1, false)
+				s.broker.PublishPhaseComplete(period.GameType, period.Phase, period.Phase+1, false)
 			case grid.PhaseAllComplete:
-				s.broker.PublishPhaseComplete(period.Phase, 0, true)
+				s.broker.PublishPhaseComplete(period.GameType, period.Phase, 0, true)
 			}
 		}
 	}

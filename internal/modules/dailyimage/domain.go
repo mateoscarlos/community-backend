@@ -29,3 +29,11 @@ type ScheduledImage struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
+
+// ScheduledPrompt is a text prompt queued up for the parallel prompt-based game.
+type ScheduledPrompt struct {
+	Date      time.Time
+	Prompt    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}

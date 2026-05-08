@@ -80,6 +80,37 @@ Returns the active period with the image (presigned URL) and all tiles with thei
 
 6. **Expired claim sweep** — a background goroutine runs every 30 seconds, releasing any claims past their TTL and setting those tiles back to `free`.
 
+7. **Storage cleanup sweep** — a separate background goroutine runs every 30 minutes (with a 5-minute startup delay) and prunes per-tile JPGs from R2/MinIO once their phase mosaic has been composed. The DB row stays and is stamped with `storage_cleaned_at`; only the orphaned object disappears. See [Object storage layout](#object-storage-layout) below.
+
+## Object storage layout
+
+The bucket (`community-assets` locally, configurable in prod) is structured by purpose. Every key here is a Postgres-tracked storage_key — nothing in the bucket is ever discovered by listing.
+
+| Prefix | Written by | Referenced from | Lifetime |
+|---|---|---|---|
+| `photos/<basename>` | Admin upload (`POST /debug/daily-image`) | `daily_images.storage_key` | Forever — the original picture is shown alongside the mosaic in the archive detail page. |
+| `schedule/<date>-<basename>` | Admin upload (Schedule grid in admin panel) | `daily_image_schedule.storage_key`, then `daily_images.storage_key` once promoted at midnight Cph | Forever — promotion just copies the key reference into `daily_images`; the object itself is reused. |
+| `tiles/<tile_uuid>.jpg` | User submission (presigned PUT) | `submissions.storage_key` | **Pruned** once a phase mosaic exists for the tile's `(period_id, phase)`. The DB row is kept and stamped via `storage_cleaned_at`; the object is deleted by the storage sweeper. |
+| `archive/<period_uuid>/phase-<N>.jpg` | Backend `ComposeFinalImage` | `period_mosaics.storage_key`, `periods.final_image_key` | Forever — this is what the archive renders. |
+| `archive/<period_uuid>/phase-<N>-thumb.jpg` | Backend `ComposeFinalImage` (thumbnail variant) | Reconstructed from the full key via `ThumbnailKey()` | Forever — the calendar list presigns the thumb to keep payloads light. |
+
+### Why tiles get pruned
+
+The mosaic produced by `ComposeFinalImage` is a single JPEG containing every drawing for that phase. Once it exists, the per-tile JPGs are dead weight: the archive only ever shows the mosaic. At phase 1 (3×3) that's 9 stale objects per period; at phase 6 (28×28) it's 784. Without cleanup, R2 storage grows roughly with `Σ phases² · periods`.
+
+The sweeper:
+
+1. Selects up to `submission.CleanupBatchSize` (500) submissions where `period_mosaics` has a row for `(period_id, phase)` and `storage_cleaned_at IS NULL`.
+2. Calls `Storage.DeleteObjects` (a single S3/R2 DeleteObjects round-trip per 1000-key batch).
+3. Stamps the cleaned rows so the next tick skips them.
+
+Failure mode: if a delete fails mid-batch, the un-removed keys simply stay un-stamped and get retried next tick. The sweep is idempotent.
+
+### What never gets cleaned automatically
+
+- `photos/`, `schedule/`, and `archive/` keys live for the lifetime of the bucket. Old completed periods are still browsable in the archive, so removing them would break the historical view.
+- If you need to drop a period entirely (e.g. a moderation issue), the debug `DELETE /debug/period?game_type=…` endpoint removes the DB rows but **does not** delete R2 objects — that's a deliberate split so we don't blow away references that the archive still expects. Pruning the storage in that case is currently a manual admin task.
+
 ## API Endpoints
 
 | Method | Path | Description |

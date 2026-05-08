@@ -21,11 +21,12 @@ var (
 )
 
 type Repository interface {
-	GetActivePeriod(ctx context.Context) (*Period, error)
+	GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error)
 	GetPeriodByID(ctx context.Context, id uuid.UUID) (*Period, error)
-	ListCompletedPeriods(ctx context.Context, limit, offset int) ([]Period, error)
+	GetPeriodByTileID(ctx context.Context, tileID uuid.UUID) (*Period, error)
+	ListCompletedPeriods(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error)
 	ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]Period, error)
-	CreatePeriod(ctx context.Context, dailyImageID uuid.UUID, gameType string, status PeriodStatus, phase int) (*Period, error)
+	CreatePeriod(ctx context.Context, dailyImageID *uuid.UUID, gameType GameType, status PeriodStatus, phase int, prompt string) (*Period, error)
 	UpdatePeriodPhase(ctx context.Context, id uuid.UUID, phase int) error
 	CompletePeriod(ctx context.Context, id uuid.UUID) error
 	SetPeriodFinalImage(ctx context.Context, id uuid.UUID, finalImageKey string) error
@@ -47,8 +48,8 @@ func NewPostgresRepository(sqlDB *sql.DB) Repository {
 	return &postgresRepository{queries: griddb.New(sqlDB)}
 }
 
-func (r *postgresRepository) GetActivePeriod(ctx context.Context) (*Period, error) {
-	row, err := r.queries.GetActivePeriod(ctx)
+func (r *postgresRepository) GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error) {
+	row, err := r.queries.GetActivePeriod(ctx, string(gameType))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPeriodNotFound
@@ -69,10 +70,22 @@ func (r *postgresRepository) GetPeriodByID(ctx context.Context, id uuid.UUID) (*
 	return periodToDomain(row), nil
 }
 
-func (r *postgresRepository) ListCompletedPeriods(ctx context.Context, limit, offset int) ([]Period, error) {
+func (r *postgresRepository) GetPeriodByTileID(ctx context.Context, tileID uuid.UUID) (*Period, error) {
+	row, err := r.queries.GetPeriodByTileID(ctx, tileID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrPeriodNotFound
+		}
+		return nil, fmt.Errorf("get period by tile id: %w", err)
+	}
+	return periodToDomain(row), nil
+}
+
+func (r *postgresRepository) ListCompletedPeriods(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error) {
 	rows, err := r.queries.ListCompletedPeriods(ctx, griddb.ListCompletedPeriodsParams{
-		Limit:  int32(limit),
-		Offset: int32(offset),
+		GameType: string(gameType),
+		Limit:    int32(limit),
+		Offset:   int32(offset),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list completed periods: %w", err)
@@ -96,12 +109,17 @@ func (r *postgresRepository) ListCompletedPeriodsMissingFinalImage(ctx context.C
 	return periods, nil
 }
 
-func (r *postgresRepository) CreatePeriod(ctx context.Context, dailyImageID uuid.UUID, gameType string, status PeriodStatus, phase int) (*Period, error) {
+func (r *postgresRepository) CreatePeriod(ctx context.Context, dailyImageID *uuid.UUID, gameType GameType, status PeriodStatus, phase int, prompt string) (*Period, error) {
+	var imgID uuid.NullUUID
+	if dailyImageID != nil {
+		imgID = uuid.NullUUID{UUID: *dailyImageID, Valid: true}
+	}
 	row, err := r.queries.CreatePeriod(ctx, griddb.CreatePeriodParams{
-		DailyImageID: dailyImageID,
-		GameType:     gameType,
+		DailyImageID: imgID,
+		GameType:     string(gameType),
 		Status:       string(status),
 		Phase:        int32(phase),
+		Prompt:       nullString(prompt),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create period: %w", err)
@@ -227,14 +245,17 @@ func (r *postgresRepository) CountTilesByStatus(ctx context.Context, periodID uu
 
 func periodToDomain(row griddb.Period) *Period {
 	p := &Period{
-		ID:           row.ID,
-		DailyImageID: row.DailyImageID,
-		GameType:     row.GameType,
-		Status:       PeriodStatus(row.Status),
-		Phase:        int(row.Phase),
-		StartedAt:    row.StartedAt,
-		CreatedAt:    row.CreatedAt,
-		UpdatedAt:    row.UpdatedAt,
+		ID:        row.ID,
+		GameType:  row.GameType,
+		Status:    PeriodStatus(row.Status),
+		Phase:     int(row.Phase),
+		StartedAt: row.StartedAt,
+		CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt,
+	}
+	if row.DailyImageID.Valid {
+		id := row.DailyImageID.UUID
+		p.DailyImageID = &id
 	}
 	if row.EndedAt.Valid {
 		p.EndedAt = &row.EndedAt.Time
@@ -244,6 +265,9 @@ func periodToDomain(row griddb.Period) *Period {
 	}
 	if row.ComposedAt.Valid {
 		p.ComposedAt = &row.ComposedAt.Time
+	}
+	if row.Prompt.Valid {
+		p.Prompt = row.Prompt.String
 	}
 	return p
 }

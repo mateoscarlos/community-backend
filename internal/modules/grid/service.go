@@ -89,14 +89,22 @@ type CurrentPeriod struct {
 	DrawnCount int64
 }
 
-// GetActivePeriod returns the active period domain object.
-func (s *Service) GetActivePeriod(ctx context.Context) (*Period, error) {
-	return s.repo.GetActivePeriod(ctx)
+// GetActivePeriod returns the active period domain object for a given game.
+func (s *Service) GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error) {
+	return s.repo.GetActivePeriod(ctx, gameType)
 }
 
-// GetCurrent returns the active period with its grid config and tiles.
-func (s *Service) GetCurrent(ctx context.Context) (*CurrentPeriod, error) {
-	period, err := s.repo.GetActivePeriod(ctx)
+// GetPeriodByTileID returns the period that owns a given tile. Used by code
+// paths (like submission) that operate on a single tile and need to derive
+// which game they're acting on.
+func (s *Service) GetPeriodByTileID(ctx context.Context, tileID uuid.UUID) (*Period, error) {
+	return s.repo.GetPeriodByTileID(ctx, tileID)
+}
+
+// GetCurrent returns the active period for the given game with its grid
+// config and tiles.
+func (s *Service) GetCurrent(ctx context.Context, gameType GameType) (*CurrentPeriod, error) {
+	period, err := s.repo.GetActivePeriod(ctx, gameType)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: get current: %w", err)
 	}
@@ -154,9 +162,10 @@ func (s *Service) GetByID(ctx context.Context, id uuid.UUID) (*CurrentPeriod, er
 	}, nil
 }
 
-// ListArchive returns completed periods with pagination.
-func (s *Service) ListArchive(ctx context.Context, limit, offset int) ([]Period, error) {
-	periods, err := s.repo.ListCompletedPeriods(ctx, limit, offset)
+// ListArchive returns completed periods with pagination, scoped to a single
+// game so photo and prompt archives stay independent.
+func (s *Service) ListArchive(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error) {
+	periods, err := s.repo.ListCompletedPeriods(ctx, gameType, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: list archive: %w", err)
 	}
@@ -296,13 +305,21 @@ func (s *Service) ListMosaics(ctx context.Context, periodID uuid.UUID) ([]PhaseM
 	return s.repo.ListMosaicsByPeriod(ctx, periodID)
 }
 
-// SweepExpiredPeriod closes the active period if it's past its daily cutoff
-// (midnight in PeriodTimezone), composes a final mosaic for whatever phase
-// was in flight, then auto-rotates by promoting today's scheduled image and
-// spawning a fresh active period. Each step's failure is logged but doesn't
-// block the others. Safe to call with no active period — returns nil.
+// SweepExpiredPeriod closes any active periods past their daily cutoff
+// (midnight in PeriodTimezone) for both games, composes a final mosaic for
+// whatever phase was in flight, then auto-rotates each game from its own
+// schedule. Each step's failure is logged but doesn't block the others.
 func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
-	p, err := s.repo.GetActivePeriod(ctx)
+	for _, gt := range []GameType{GamePhoto, GamePrompt} {
+		if err := s.sweepGame(ctx, gt); err != nil {
+			s.log.Warn().Err(err).Str("game_type", string(gt)).Msg("sweep game")
+		}
+	}
+	return nil
+}
+
+func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
+	p, err := s.repo.GetActivePeriod(ctx, gameType)
 	if err == nil {
 		if !isPastDailyCutoff(p.StartedAt, time.Now()) {
 			return nil
@@ -323,6 +340,7 @@ func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
 
 		s.log.Info().
 			Str("period_id", p.ID.String()).
+			Str("game_type", string(gameType)).
 			Int64("drawn", drawn).
 			Int64("total", total).
 			Int("phase", p.Phase).
@@ -331,20 +349,25 @@ func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
 		return fmt.Errorf("sweep period: get active: %w", err)
 	}
 
-	// Try to spawn a new period for today using the schedule. Always attempted,
-	// whether we just closed one or there was no active period (e.g. backend
-	// restarted past midnight). Errors are logged, not returned — the sweeper
-	// will retry on the next tick.
-	if err := s.rotateForToday(ctx); err != nil {
-		s.log.Warn().Err(err).Msg("sweep period: auto-rotate skipped")
+	// Try to spawn a new period for today using the per-game schedule.
+	if err := s.rotateForToday(ctx, gameType); err != nil {
+		s.log.Warn().Err(err).Str("game_type", string(gameType)).Msg("sweep period: auto-rotate skipped")
 	}
 	return nil
 }
 
-// rotateForToday promotes the scheduled image for the current Cph date and
+// RotateForToday is the exported wrapper around rotateForToday so callers
+// outside the package (e.g. the debug handler reacting to a schedule upsert)
+// can trigger an immediate rotation when an admin uploads today's content
+// instead of waiting for the midnight sweeper.
+func (s *Service) RotateForToday(ctx context.Context, gameType GameType) error {
+	return s.rotateForToday(ctx, gameType)
+}
+
+// rotateForToday promotes today's schedule entry for the given game and
 // creates an active period from it. No-op if a period for today already exists
-// or no image is scheduled.
-func (s *Service) rotateForToday(ctx context.Context) error {
+// or nothing is scheduled.
+func (s *Service) rotateForToday(ctx context.Context, gameType GameType) error {
 	loc, err := time.LoadLocation(PeriodTimezone)
 	if err != nil {
 		return fmt.Errorf("load tz: %w", err)
@@ -353,8 +376,7 @@ func (s *Service) rotateForToday(ctx context.Context) error {
 	y, m, d := now.Date()
 	today := time.Date(y, m, d, 0, 0, 0, 0, loc)
 
-	// Don't double-spawn — if there's already an active period for today, bail.
-	if existing, err := s.repo.GetActivePeriod(ctx); err == nil {
+	if existing, err := s.repo.GetActivePeriod(ctx, gameType); err == nil {
 		startedLocal := existing.StartedAt.In(loc)
 		ey, em, ed := startedLocal.Date()
 		if ey == y && em == m && ed == d {
@@ -362,6 +384,17 @@ func (s *Service) rotateForToday(ctx context.Context) error {
 		}
 	}
 
+	switch gameType {
+	case GamePhoto:
+		return s.rotatePhotoForToday(ctx, today)
+	case GamePrompt:
+		return s.rotatePromptForToday(ctx, today)
+	default:
+		return fmt.Errorf("rotate: unknown game type %q", gameType)
+	}
+}
+
+func (s *Service) rotatePhotoForToday(ctx context.Context, today time.Time) error {
 	scheduled, err := s.imgRepo.GetScheduledByDate(ctx, today)
 	if err != nil {
 		if errors.Is(err, dailyimage.ErrNotFound) {
@@ -375,7 +408,7 @@ func (s *Service) rotateForToday(ctx context.Context) error {
 		return fmt.Errorf("promote scheduled: %w", err)
 	}
 
-	period, err := s.CreatePeriodWithTiles(ctx, img.ID, "photo")
+	period, err := s.CreatePhotoPeriod(ctx, img.ID)
 	if err != nil {
 		return fmt.Errorf("create period: %w", err)
 	}
@@ -384,6 +417,27 @@ func (s *Service) rotateForToday(ctx context.Context) error {
 		Str("period_id", period.ID.String()).
 		Str("date", today.Format("2006-01-02")).
 		Msg("auto-rotated to scheduled image")
+	return nil
+}
+
+func (s *Service) rotatePromptForToday(ctx context.Context, today time.Time) error {
+	scheduled, err := s.imgRepo.GetScheduledPromptByDate(ctx, today)
+	if err != nil {
+		if errors.Is(err, dailyimage.ErrNotFound) {
+			return fmt.Errorf("no scheduled prompt for %s", today.Format("2006-01-02"))
+		}
+		return fmt.Errorf("get scheduled prompt: %w", err)
+	}
+
+	period, err := s.CreatePromptPeriod(ctx, scheduled.Prompt)
+	if err != nil {
+		return fmt.Errorf("create period: %w", err)
+	}
+
+	s.log.Info().
+		Str("period_id", period.ID.String()).
+		Str("date", today.Format("2006-01-02")).
+		Msg("auto-rotated to scheduled prompt")
 	return nil
 }
 
@@ -405,33 +459,56 @@ func (s *Service) RecomposeMissing(ctx context.Context) (int, error) {
 	return composed, nil
 }
 
-// CreatePeriodWithTiles creates a new active period and generates all tiles for phase 1.
-func (s *Service) CreatePeriodWithTiles(ctx context.Context, dailyImageID uuid.UUID, gameType string) (*Period, error) {
+// CreatePhotoPeriod creates a new active photo-game period anchored to a
+// daily image and generates all tiles for phase 1.
+func (s *Service) CreatePhotoPeriod(ctx context.Context, dailyImageID uuid.UUID) (*Period, error) {
+	period, err := s.repo.CreatePeriod(ctx, &dailyImageID, GamePhoto, PeriodActive, 1, "")
+	if err != nil {
+		return nil, fmt.Errorf("grid service: create photo period: %w", err)
+	}
+	if err := s.populatePhase1Tiles(ctx, period); err != nil {
+		return nil, err
+	}
+	return period, nil
+}
+
+// CreatePromptPeriod creates a new active prompt-game period anchored to a
+// text prompt and generates all tiles for phase 1.
+func (s *Service) CreatePromptPeriod(ctx context.Context, prompt string) (*Period, error) {
+	if prompt == "" {
+		return nil, fmt.Errorf("grid service: prompt period requires non-empty prompt")
+	}
+	period, err := s.repo.CreatePeriod(ctx, nil, GamePrompt, PeriodActive, 1, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("grid service: create prompt period: %w", err)
+	}
+	if err := s.populatePhase1Tiles(ctx, period); err != nil {
+		return nil, err
+	}
+	return period, nil
+}
+
+func (s *Service) populatePhase1Tiles(ctx context.Context, period *Period) error {
 	gridCfg, err := s.repo.GetGridConfig(ctx, 1)
 	if err != nil {
-		return nil, fmt.Errorf("grid service: get phase 1 config: %w", err)
-	}
-
-	period, err := s.repo.CreatePeriod(ctx, dailyImageID, gameType, PeriodActive, 1)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: create period: %w", err)
+		return fmt.Errorf("grid service: get phase 1 config: %w", err)
 	}
 
 	for row := range gridCfg.Rows {
 		for col := range gridCfg.Columns {
 			if _, err := s.repo.CreateTile(ctx, period.ID, 1, row, col); err != nil {
-				return nil, fmt.Errorf("grid service: create tile [%d,%d]: %w", row, col, err)
+				return fmt.Errorf("grid service: create tile [%d,%d]: %w", row, col, err)
 			}
 		}
 	}
 
 	s.log.Info().
 		Str("period_id", period.ID.String()).
+		Str("game_type", period.GameType).
 		Int("rows", gridCfg.Rows).
 		Int("cols", gridCfg.Columns).
 		Msg("created period with tiles")
-
-	return period, nil
+	return nil
 }
 
 // PhaseResult describes what happened after checking phase completion.

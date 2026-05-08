@@ -28,6 +28,10 @@ type Repository interface {
 	GetClaimByTileID(ctx context.Context, tileID uuid.UUID) (*Claim, error)
 	GetActiveClaimBySessionAndTile(ctx context.Context, tileID uuid.UUID, sessionID string) (*Claim, error)
 	HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error)
+	// HasActiveClaimForSessionInGameOfTile reports whether the session already
+	// holds an active claim on any tile in the same game (photo / prompt) as
+	// the target tile. Lets a session hold one claim per game in parallel.
+	HasActiveClaimForSessionInGameOfTile(ctx context.Context, sessionID string, targetTileID uuid.UUID) (bool, error)
 
 	// HeartbeatClaim refreshes last_heartbeat_at and returns expires_at.
 	// Returns ErrClaimNotFound if no active claim matches.
@@ -162,6 +166,29 @@ func (r *postgresRepository) ExtendClaim(ctx context.Context, tileID uuid.UUID, 
 		return time.Time{}, fmt.Errorf("extend claim: %w", err)
 	}
 	return expiresAt, nil
+}
+
+func (r *postgresRepository) HasActiveClaimForSessionInGameOfTile(ctx context.Context, sessionID string, targetTileID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM claims c
+			JOIN tiles t      ON t.id = c.tile_id
+			JOIN periods p    ON p.id = t.period_id
+			JOIN tiles target ON target.id = $2
+			JOIN periods tp   ON tp.id = target.period_id
+			WHERE c.session_id = $1
+			  AND c.released_at IS NULL
+			  AND c.expires_at > NOW()
+			  AND p.game_type = tp.game_type
+		)`,
+		sessionID, targetTileID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("has active claim for session in game: %w", err)
+	}
+	return exists, nil
 }
 
 func (r *postgresRepository) HasActiveClaimForSession(ctx context.Context, sessionID string) (bool, error) {

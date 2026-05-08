@@ -15,4 +15,5 @@ var Module = fx.Options(
 			fx.ResultTags(`group:"routes"`),
 		),
 	),
+	fx.Invoke(StartStorageSweeper),
 )

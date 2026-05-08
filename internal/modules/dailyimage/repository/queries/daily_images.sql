@@ -38,6 +38,30 @@ ORDER BY date ASC;
 -- name: DeleteScheduledByDate :exec
 DELETE FROM daily_image_schedule WHERE date = $1;
 
+-- --- Prompt schedule (parallel "draw from a prompt" game) ---
+
+-- name: UpsertScheduledPrompt :one
+INSERT INTO daily_prompt_schedule (date, prompt)
+VALUES ($1, $2)
+ON CONFLICT (date) DO UPDATE
+    SET prompt     = EXCLUDED.prompt,
+        updated_at = now()
+RETURNING date, prompt, created_at, updated_at;
+
+-- name: GetScheduledPromptByDate :one
+SELECT date, prompt, created_at, updated_at
+FROM daily_prompt_schedule
+WHERE date = $1;
+
+-- name: ListPromptScheduleRange :many
+SELECT date, prompt, created_at, updated_at
+FROM daily_prompt_schedule
+WHERE date >= $1 AND date <= $2
+ORDER BY date ASC;
+
+-- name: DeleteScheduledPromptByDate :exec
+DELETE FROM daily_prompt_schedule WHERE date = $1;
+
 -- name: DeactivateAllDailyImages :exec
 UPDATE daily_images SET is_active = false, updated_at = now()
 WHERE is_active = true;

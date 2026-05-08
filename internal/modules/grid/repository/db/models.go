@@ -43,6 +43,13 @@ type DailyImageSchedule struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+type DailyPromptSchedule struct {
+	Date      time.Time `json:"date"`
+	Prompt    string    `json:"prompt"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Feedback struct {
 	ID        uuid.UUID `json:"id"`
 	Message   string    `json:"message"`
@@ -60,7 +67,7 @@ type GridConfig struct {
 
 type Period struct {
 	ID            uuid.UUID      `json:"id"`
-	DailyImageID  uuid.UUID      `json:"daily_image_id"`
+	DailyImageID  uuid.NullUUID  `json:"daily_image_id"`
 	GameType      string         `json:"game_type"`
 	Status        string         `json:"status"`
 	Phase         int32          `json:"phase"`
@@ -70,6 +77,7 @@ type Period struct {
 	UpdatedAt     time.Time      `json:"updated_at"`
 	FinalImageKey sql.NullString `json:"final_image_key"`
 	ComposedAt    sql.NullTime   `json:"composed_at"`
+	Prompt        sql.NullString `json:"prompt"`
 }
 
 type PeriodMosaic struct {
@@ -85,15 +93,16 @@ type SchemaInfo struct {
 }
 
 type Submission struct {
-	ID         uuid.UUID `json:"id"`
-	TileID     uuid.UUID `json:"tile_id"`
-	ClaimID    uuid.UUID `json:"claim_id"`
-	StorageKey string    `json:"storage_key"`
-	CropX      float64   `json:"crop_x"`
-	CropY      float64   `json:"crop_y"`
-	CropWidth  float64   `json:"crop_width"`
-	CropHeight float64   `json:"crop_height"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID               uuid.UUID    `json:"id"`
+	TileID           uuid.UUID    `json:"tile_id"`
+	ClaimID          uuid.UUID    `json:"claim_id"`
+	StorageKey       string       `json:"storage_key"`
+	CropX            float64      `json:"crop_x"`
+	CropY            float64      `json:"crop_y"`
+	CropWidth        float64      `json:"crop_width"`
+	CropHeight       float64      `json:"crop_height"`
+	CreatedAt        time.Time    `json:"created_at"`
+	StorageCleanedAt sql.NullTime `json:"storage_cleaned_at"`
 }
 
 type Tile struct {

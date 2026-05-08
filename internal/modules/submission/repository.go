@@ -12,12 +12,27 @@ import (
 	submissiondb "github.com/community-app/community-backend/internal/modules/submission/repository/db"
 )
 
+// CleanupCandidate is the projection used by the storage sweeper —
+// just enough to delete the R2 object and stamp the row as cleaned.
+type CleanupCandidate struct {
+	ID         uuid.UUID
+	StorageKey string
+}
+
 type Repository interface {
 	// SubmitTile atomically verifies claim ownership, creates submission,
 	// marks tile as drawn, and releases the claim.
 	SubmitTile(ctx context.Context, tileID uuid.UUID, sessionID, storageKey string, crop Crop) (*Submission, error)
 
 	GetByTileID(ctx context.Context, tileID uuid.UUID) (*Submission, error)
+
+	// ListCleanupCandidates returns submissions whose phase has been composed
+	// into a mosaic and whose backing storage object has not yet been pruned.
+	ListCleanupCandidates(ctx context.Context, limit int) ([]CleanupCandidate, error)
+
+	// MarkCleaned stamps the listed submissions' storage_cleaned_at so the
+	// next sweep skips them.
+	MarkCleaned(ctx context.Context, ids []uuid.UUID) error
 }
 
 type postgresRepository struct {
@@ -60,6 +75,28 @@ func (r *postgresRepository) GetByTileID(ctx context.Context, tileID uuid.UUID) 
 		return nil, fmt.Errorf("get submission by tile: %w", err)
 	}
 	return toDomain(row), nil
+}
+
+func (r *postgresRepository) ListCleanupCandidates(ctx context.Context, limit int) ([]CleanupCandidate, error) {
+	rows, err := r.queries.ListCleanupCandidates(ctx, int32(limit))
+	if err != nil {
+		return nil, fmt.Errorf("list cleanup candidates: %w", err)
+	}
+	out := make([]CleanupCandidate, len(rows))
+	for i, row := range rows {
+		out[i] = CleanupCandidate{ID: row.ID, StorageKey: row.StorageKey}
+	}
+	return out, nil
+}
+
+func (r *postgresRepository) MarkCleaned(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := r.queries.MarkSubmissionsCleaned(ctx, ids); err != nil {
+		return fmt.Errorf("mark cleaned: %w", err)
+	}
+	return nil
 }
 
 func toDomain(row submissiondb.Submission) *Submission {
