@@ -26,6 +26,8 @@ func NewHandler(svc *Service, log zerolog.Logger) *Handler {
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Post("/api/v1/uploads/presign", h.presign)
 	r.Post("/api/v1/tiles/{id}/submit", h.submit)
+	r.Post("/api/v1/uploads/stage-presign", h.stagePresign)
+	r.Get("/api/v1/uploads/staged", h.getStaged)
 }
 
 func (h *Handler) presign(w http.ResponseWriter, r *http.Request) {
@@ -110,4 +112,73 @@ type submitResponse struct {
 	ID         string `json:"id"`
 	TileID     string `json:"tile_id"`
 	StorageKey string `json:"storage_key"`
+}
+
+type stagedResponse struct {
+	DownloadURL string `json:"download_url"`
+}
+
+// stagePresign hands the phone a presigned PUT URL it can use to upload a
+// raw camera photo. The laptop driving the game later picks it up via
+// GET /uploads/staged.
+func (h *Handler) stagePresign(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TileID    string `json:"tile_id"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	tileID, err := uuid.Parse(body.TileID)
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid tile_id")
+		return
+	}
+	if body.SessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	uploadURL, storageKey, err := h.svc.PresignStage(r.Context(), tileID, body.SessionID)
+	if err != nil {
+		h.log.Error().Err(err).Msg("stage presign")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, presignResponse{
+		UploadURL:        uploadURL,
+		StorageKey:       storageKey,
+		ExpiresInSeconds: int((5 * time.Minute).Seconds()),
+	})
+}
+
+// getStaged returns a download URL if the phone has uploaded a photo for the
+// given (tile, session), or 404 if not yet — the laptop polls this endpoint.
+func (h *Handler) getStaged(w http.ResponseWriter, r *http.Request) {
+	tileIDStr := r.URL.Query().Get("tile")
+	sessionID := r.URL.Query().Get("session")
+	if tileIDStr == "" || sessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "tile and session are required")
+		return
+	}
+	tileID, err := uuid.Parse(tileIDStr)
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid tile")
+		return
+	}
+
+	downloadURL, exists, err := h.svc.GetStaged(r.Context(), tileID, sessionID)
+	if err != nil {
+		h.log.Error().Err(err).Msg("get staged")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	httpserver.WriteJSON(w, http.StatusOK, stagedResponse{DownloadURL: downloadURL})
 }

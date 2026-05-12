@@ -90,6 +90,7 @@ The bucket (`community-assets` locally, configurable in prod) is structured by p
 |---|---|---|---|
 | `photos/<basename>` | Admin upload (`POST /debug/daily-image`) | `daily_images.storage_key` | Forever — the original picture is shown alongside the mosaic in the archive detail page. |
 | `schedule/<date>-<basename>` | Admin upload (Schedule grid in admin panel) | `daily_image_schedule.storage_key`, then `daily_images.storage_key` once promoted at midnight Cph | Forever — promotion just copies the key reference into `daily_images`; the object itself is reused. |
+| `staging/<tile_uuid>-<session_id>.jpg` | Phone QR upload (presigned PUT) | Not tracked in DB — picked up by the laptop via `GET /uploads/staged` | **Pruned** immediately on successful submit; orphaned files (laptop abandoned the flow) stay until a future sweeper pass. |
 | `tiles/<tile_uuid>.jpg` | User submission (presigned PUT) | `submissions.storage_key` | **Pruned** once a phase mosaic exists for the tile's `(period_id, phase)`. The DB row is kept and stamped via `storage_cleaned_at`; the object is deleted by the storage sweeper. |
 | `archive/<period_uuid>/phase-<N>.jpg` | Backend `ComposeFinalImage` | `period_mosaics.storage_key`, `periods.final_image_key` | Forever — this is what the archive renders. |
 | `archive/<period_uuid>/phase-<N>-thumb.jpg` | Backend `ComposeFinalImage` (thumbnail variant) | Reconstructed from the full key via `ThumbnailKey()` | Forever — the calendar list presigns the thumb to keep payloads light. |
@@ -122,6 +123,8 @@ Failure mode: if a delete fails mid-batch, the un-removed keys simply stay un-st
 | POST | `/api/v1/tiles/{id}/claim` | Claim a tile (body: `nickname`, `session_id`) |
 | DELETE | `/api/v1/tiles/{id}/claim` | Release a claim (body: `session_id`) |
 | POST | `/api/v1/uploads/presign` | Get presigned upload URL (body: `tile_id`, `session_id`) |
+| POST | `/api/v1/uploads/stage-presign` | Phone-side presigned PUT for the raw camera photo (body: `tile_id`, `session_id`) |
+| GET | `/api/v1/uploads/staged?tile=…&session=…` | Laptop polls this until the phone has uploaded; returns `download_url` or 404 |
 | POST | `/api/v1/tiles/{id}/submit` | Confirm drawing submission |
 | POST | `/api/v1/feedback` | Submit feedback (no auth required) |
 

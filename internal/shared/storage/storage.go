@@ -78,6 +78,20 @@ func (s *Storage) Ping(ctx context.Context) error {
 	return err
 }
 
+// StatObject checks whether an object exists. Returns (true, contentType, nil)
+// if found, (false, "", nil) if not found. Other errors surface as-is.
+func (s *Storage) StatObject(ctx context.Context, key string) (bool, string, error) {
+	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.Code == "NoSuchKey" || resp.StatusCode == 404 {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("stat %q: %w", key, err)
+	}
+	return true, info.ContentType, nil
+}
+
 // PresignedGetURL returns a time-limited URL to download an object.
 func (s *Storage) PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
 	u, err := s.client.PresignedGetObject(ctx, s.bucket, key, expiry, nil)

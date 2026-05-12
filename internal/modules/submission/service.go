@@ -46,6 +46,52 @@ func (s *Service) Presign(ctx context.Context, tileID uuid.UUID, contentType str
 	return uploadURL, storageKey, nil
 }
 
+// stagingKey is the deterministic R2 key used to hand a raw phone-camera
+// photo to the laptop that's driving the game. Keyed by (tile, session) so
+// the laptop can locate it without an extra round-trip.
+func stagingKey(tileID uuid.UUID, sessionID string) string {
+	return fmt.Sprintf("staging/%s-%s.jpg", tileID.String(), sessionID)
+}
+
+// PresignStage returns a presigned PUT URL the phone uses to drop a raw
+// photo at the staging key. The laptop later picks it up via GetStaged.
+func (s *Service) PresignStage(ctx context.Context, tileID uuid.UUID, sessionID string) (uploadURL, key string, err error) {
+	key = stagingKey(tileID, sessionID)
+	uploadURL, err = s.store.PresignedPutURL(ctx, key, 5*time.Minute)
+	if err != nil {
+		return "", "", fmt.Errorf("submission service: presign stage: %w", err)
+	}
+	return uploadURL, key, nil
+}
+
+// GetStaged returns a presigned download URL for a staged raw photo if one
+// has been uploaded for this (tile, session). exists=false means the laptop
+// should keep polling.
+func (s *Service) GetStaged(ctx context.Context, tileID uuid.UUID, sessionID string) (downloadURL string, exists bool, err error) {
+	key := stagingKey(tileID, sessionID)
+	exists, _, err = s.store.StatObject(ctx, key)
+	if err != nil {
+		return "", false, fmt.Errorf("submission service: stat stage: %w", err)
+	}
+	if !exists {
+		return "", false, nil
+	}
+	downloadURL, err = s.store.PresignedGetURL(ctx, key, 15*time.Minute)
+	if err != nil {
+		return "", false, fmt.Errorf("submission service: presign get stage: %w", err)
+	}
+	return downloadURL, true, nil
+}
+
+// deleteStaged removes the staging photo for a (tile, session) — called after
+// the laptop has handed in its edited submission. Errors are non-fatal.
+func (s *Service) deleteStaged(ctx context.Context, tileID uuid.UUID, sessionID string) {
+	key := stagingKey(tileID, sessionID)
+	if err := s.store.DeleteObject(ctx, key); err != nil {
+		s.log.Warn().Err(err).Str("key", key).Msg("delete staged photo")
+	}
+}
+
 // CleanupBatchSize caps how many R2 objects we attempt to delete per sweep
 // tick. Picked so a worst-case backlog clears within a few ticks without
 // blocking other work for too long. Below the 1000-key R2 batch limit so
@@ -110,6 +156,10 @@ func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, stora
 		Str("tile_id", tileID.String()).
 		Str("storage_key", storageKey).
 		Msg("tile submitted")
+
+	// Best-effort cleanup of the raw photo the phone uploaded — only the
+	// edited submission is kept long-term.
+	s.deleteStaged(ctx, tileID, sessionID)
 
 	// Generate a presigned URL for the drawing so SSE clients can render it immediately.
 	imgURL, _ := s.store.PresignedGetURL(ctx, sub.StorageKey, 15*time.Minute)
