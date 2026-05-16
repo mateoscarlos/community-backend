@@ -6,7 +6,10 @@ import (
 	"go.uber.org/fx"
 )
 
-// Module registers debug endpoints only when ENV != "prod".
+// Module registers the admin/debug endpoints only when ADMIN_SECRET is set.
+// This works in every environment (local, dev, prod) — the routes simply
+// don't exist unless a secret is configured, and when they do exist every
+// request must present a matching X-Admin-Secret header (see handler.go).
 var Module = fx.Options(
 	fx.Provide(
 		NewHandler,
@@ -18,10 +21,11 @@ var Module = fx.Options(
 	),
 )
 
-// newRegistrarIfEnabled returns the debug Handler in non-prod environments,
-// or a no-op registrar in production so no routes are ever exposed.
+// newRegistrarIfEnabled returns the debug Handler when an admin secret is
+// configured, or a no-op registrar otherwise so the routes are never exposed
+// without protection.
 func newRegistrarIfEnabled(cfg *config.Config, h *Handler) httpserver.RouteRegistrar {
-	if cfg.Env == "prod" {
+	if cfg.AdminSecret == "" {
 		return nopRegistrar{}
 	}
 	return h

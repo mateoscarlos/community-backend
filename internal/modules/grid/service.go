@@ -2,6 +2,7 @@ package grid
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/community-app/community-backend/internal/modules/dailyimage"
+	"github.com/community-app/community-backend/internal/shared/appsettings"
 	"github.com/community-app/community-backend/internal/shared/composer"
 	"github.com/community-app/community-backend/internal/shared/storage"
 	"github.com/google/uuid"
@@ -75,11 +77,24 @@ type Service struct {
 	repo    Repository
 	imgRepo dailyimage.Repository
 	store   *storage.Storage
+	db      *sql.DB
 	log     zerolog.Logger
 }
 
-func NewService(repo Repository, imgRepo dailyimage.Repository, store *storage.Storage, log zerolog.Logger) *Service {
-	return &Service{repo: repo, imgRepo: imgRepo, store: store, log: log}
+func NewService(repo Repository, imgRepo dailyimage.Repository, store *storage.Storage, db *sql.DB, log zerolog.Logger) *Service {
+	return &Service{repo: repo, imgRepo: imgRepo, store: store, db: db, log: log}
+}
+
+// isPastCutoff reports whether the period that started at startedAt should now
+// be closed. If a period duration is configured in app_settings it's a fixed
+// span (startedAt + duration); otherwise it falls back to the legacy daily
+// cutoff (midnight in PeriodTimezone). Changing the setting affects the
+// running period at the next sweep — that's the intended "global knob".
+func (s *Service) isPastCutoff(ctx context.Context, startedAt, now time.Time) bool {
+	if dur, ok := appsettings.PeriodDuration(ctx, s.db); ok {
+		return !now.Before(startedAt.Add(dur))
+	}
+	return isPastDailyCutoff(startedAt, now)
 }
 
 type CurrentPeriod struct {
@@ -321,7 +336,7 @@ func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
 func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
 	p, err := s.repo.GetActivePeriod(ctx, gameType)
 	if err == nil {
-		if !isPastDailyCutoff(p.StartedAt, time.Now()) {
+		if !s.isPastCutoff(ctx, p.StartedAt, time.Now()) {
 			return nil
 		}
 
@@ -538,8 +553,9 @@ func (s *Service) CheckPhaseCompletion(ctx context.Context, periodID uuid.UUID) 
 
 	completedPhase := period.Phase
 
-	// Day rollover (midnight Cph) or phase-cap reached → close the period.
-	timeUp := isPastDailyCutoff(period.StartedAt, time.Now())
+	// Configured duration elapsed (or legacy midnight) or phase-cap reached
+	// → close the period.
+	timeUp := s.isPastCutoff(ctx, period.StartedAt, time.Now())
 	phasesUp := completedPhase >= MaxPhasesPerPeriod
 
 	nextPhase := completedPhase + 1

@@ -2,6 +2,7 @@ package debug
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -12,8 +13,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/community-app/community-backend/internal/config"
 	"github.com/community-app/community-backend/internal/modules/dailyimage"
 	"github.com/community-app/community-backend/internal/modules/grid"
+	"github.com/community-app/community-backend/internal/shared/appsettings"
 	"github.com/community-app/community-backend/internal/shared/httpserver"
 	"github.com/community-app/community-backend/internal/shared/sse"
 	"github.com/community-app/community-backend/internal/shared/storage"
@@ -28,24 +31,50 @@ const (
 	drawAllUploadConcurrency = 16
 )
 
-// Handler exposes debug-only endpoints. Never registered in production.
+// Handler exposes the admin/debug endpoints. Only registered when an admin
+// secret is configured; every route is additionally guarded by requireAdmin.
 type Handler struct {
-	repo    dailyimage.Repository
-	gridSvc *grid.Service
-	store   *storage.Storage
-	broker  *sse.Broker
-	db      *sql.DB
-	log     zerolog.Logger
+	repo        dailyimage.Repository
+	gridSvc     *grid.Service
+	store       *storage.Storage
+	broker      *sse.Broker
+	db          *sql.DB
+	log         zerolog.Logger
+	adminSecret string
 }
 
 var _ httpserver.RouteRegistrar = (*Handler)(nil)
 
-func NewHandler(repo dailyimage.Repository, gridSvc *grid.Service, store *storage.Storage, broker *sse.Broker, db *sql.DB, log zerolog.Logger) *Handler {
-	return &Handler{repo: repo, gridSvc: gridSvc, store: store, broker: broker, db: db, log: log}
+func NewHandler(cfg *config.Config, repo dailyimage.Repository, gridSvc *grid.Service, store *storage.Storage, broker *sse.Broker, db *sql.DB, log zerolog.Logger) *Handler {
+	return &Handler{
+		repo:        repo,
+		gridSvc:     gridSvc,
+		store:       store,
+		broker:      broker,
+		db:          db,
+		log:         log,
+		adminSecret: cfg.AdminSecret,
+	}
+}
+
+// requireAdmin rejects any request that doesn't carry the matching
+// X-Admin-Secret header. Constant-time comparison avoids leaking the secret
+// via timing. This is the real authorization boundary for every admin route.
+func (h *Handler) requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("X-Admin-Secret")
+		if h.adminSecret == "" ||
+			subtle.ConstantTimeCompare([]byte(got), []byte(h.adminSecret)) != 1 {
+			httpserver.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Route("/debug", func(r chi.Router) {
+		r.Use(h.requireAdmin)
 		r.Get("/storage/upload-url", h.getUploadURL)
 		r.Post("/daily-image", h.setActiveDailyImage)
 		r.Post("/period", h.createPeriod)
@@ -65,10 +94,63 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Post("/prompt-schedule", h.upsertPromptSchedule)
 		r.Delete("/prompt-schedule/{date}", h.deletePromptSchedule)
 
+		// Global period duration knob.
+		r.Get("/period-duration", h.getPeriodDuration)
+		r.Put("/period-duration", h.setPeriodDuration)
+
 		// Sessions / users.
 		r.Get("/sessions", h.listSessions)
 		r.Get("/sessions/{id}", h.getSession)
 	})
+}
+
+// getPeriodDuration returns the configured global period length in hours, or
+// hours=null when unset (legacy daily/midnight cutoff is in effect).
+// Usage: GET /debug/period-duration
+func (h *Handler) getPeriodDuration(w http.ResponseWriter, r *http.Request) {
+	dur, ok := appsettings.PeriodDuration(r.Context(), h.db)
+	resp := struct {
+		Hours *float64 `json:"hours"`
+	}{}
+	if ok {
+		hours := dur.Hours()
+		resp.Hours = &hours
+	}
+	httpserver.WriteJSON(w, http.StatusOK, resp)
+}
+
+// setPeriodDuration sets the global period length. hours > 0 applies a fixed
+// span to new (and the running) period at the next sweep; hours <= 0 reverts
+// to the legacy daily cutoff. Usage: PUT /debug/period-duration {"hours": 168}
+func (h *Handler) setPeriodDuration(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Hours float64 `json:"hours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	// Guard against absurd values: max 1 year.
+	if body.Hours > 24*366 {
+		httpserver.WriteError(w, http.StatusBadRequest, "duration too long")
+		return
+	}
+	hours := body.Hours
+	if hours < 0 {
+		hours = 0
+	}
+	if err := appsettings.SetPeriodDurationHours(r.Context(), h.db, hours); err != nil {
+		h.log.Error().Err(err).Msg("set period duration")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	var out *float64
+	if hours > 0 {
+		out = &hours
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Hours *float64 `json:"hours"`
+	}{Hours: out})
 }
 
 // recomposeArchives backfills final mosaic images for completed periods that

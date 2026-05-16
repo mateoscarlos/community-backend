@@ -12,6 +12,12 @@ type Config struct {
 	Env                string `envconfig:"ENV" default:"local"` // local | dev | prod
 	CORSAllowedOrigins []string `envconfig:"CORS_ALLOWED_ORIGINS"`
 
+	// Admin: shared secret that gates the /debug admin endpoints. When empty
+	// the admin routes are not registered at all (in any environment). When
+	// set, the routes exist but every request must present a matching
+	// X-Admin-Secret header.
+	AdminSecret string `envconfig:"ADMIN_SECRET"`
+
 	// Logging
 	LogLevel     string `envconfig:"LOG_LEVEL" default:"info"` // debug | info | warn | error
 	LokiURL      string `envconfig:"LOKI_URL"`
