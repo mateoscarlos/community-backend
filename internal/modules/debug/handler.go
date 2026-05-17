@@ -985,8 +985,22 @@ func (h *Handler) upsertPromptSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isTodayInCph(date) {
+		// Two cases: no period for today yet → create it from the schedule;
+		// or one is already running → RotateForToday is a no-op, so push the
+		// new prompt onto the live period in place and tell clients to refetch
+		// (otherwise an edited prompt never shows until the next rotation).
 		if err := h.gridSvc.RotateForToday(r.Context(), grid.GamePrompt); err != nil {
 			h.log.Warn().Err(err).Msg("prompt schedule: rotate today")
+		}
+		if period, err := h.gridSvc.GetActivePeriod(r.Context(), grid.GamePrompt); err == nil {
+			if _, err := h.db.ExecContext(r.Context(),
+				`UPDATE periods SET prompt = $1, updated_at = now() WHERE id = $2`,
+				body.Prompt, period.ID,
+			); err != nil {
+				h.log.Error().Err(err).Msg("prompt schedule: update live period prompt")
+			} else {
+				h.broker.PublishPeriodUpdated(string(grid.GamePrompt))
+			}
 		}
 	}
 

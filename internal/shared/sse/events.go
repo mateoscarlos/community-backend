@@ -8,6 +8,7 @@ const (
 	EventTileFreed     = "tile_freed"
 	EventTileDrawn     = "tile_drawn"
 	EventPhaseComplete = "phase_complete"
+	EventPeriodUpdated = "period_updated"
 )
 
 // TileEvent is the payload for tile state change events.
@@ -51,4 +52,17 @@ func (b *Broker) PublishPhaseComplete(gameType string, completedPhase, nextPhase
 		Completed: periodCompleted,
 	})
 	b.Publish(Event{Type: EventPhaseComplete, Data: data})
+}
+
+// PeriodUpdatedEvent signals that the active period's metadata changed in
+// place (e.g. an admin edited today's prompt) and clients should refetch.
+type PeriodUpdatedEvent struct {
+	GameType string `json:"game_type"`
+}
+
+// PublishPeriodUpdated tells clients of the given game to refetch the current
+// period — used when the period changes without a tile/phase transition.
+func (b *Broker) PublishPeriodUpdated(gameType string) {
+	data, _ := json.Marshal(PeriodUpdatedEvent{GameType: gameType})
+	b.Publish(Event{Type: EventPeriodUpdated, Data: data})
 }
