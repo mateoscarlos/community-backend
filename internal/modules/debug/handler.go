@@ -16,6 +16,7 @@ import (
 	"github.com/community-app/community-backend/internal/config"
 	"github.com/community-app/community-backend/internal/modules/dailyimage"
 	"github.com/community-app/community-backend/internal/modules/grid"
+	"github.com/community-app/community-backend/internal/modules/retention"
 	"github.com/community-app/community-backend/internal/shared/appsettings"
 	"github.com/community-app/community-backend/internal/shared/httpserver"
 	"github.com/community-app/community-backend/internal/shared/sse"
@@ -98,10 +99,179 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Get("/period-duration", h.getPeriodDuration)
 		r.Put("/period-duration", h.setPeriodDuration)
 
+		// Feedback inbox (admin only).
+		r.Get("/feedback", h.listFeedback)
+		r.Post("/feedback/{id}/read", h.markFeedbackRead)
+		r.Delete("/feedback/{id}/read", h.markFeedbackUnread)
+
+		// Storage / retention cleanup.
+		r.Get("/retention", h.getRetention)
+		r.Put("/retention", h.setRetention)
+		r.Post("/retention/purge", h.purgeRetention)
+
 		// Sessions / users.
 		r.Get("/sessions", h.listSessions)
 		r.Get("/sessions/{id}", h.getSession)
 	})
+}
+
+// listFeedback returns every feedback entry, newest first, each tagged with
+// whether an admin has marked it read. Usage: GET /debug/feedback
+func (h *Handler) listFeedback(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 1000 {
+		limit = l
+	}
+
+	const q = `
+		SELECT f.id, f.message, f.contact, f.rating, f.context, f.created_at, fr.viewed_at
+		FROM feedback f
+		LEFT JOIN feedback_read fr ON fr.feedback_id = f.id
+		ORDER BY f.created_at DESC
+		LIMIT $1
+	`
+	rows, err := h.db.QueryContext(r.Context(), q, limit)
+	if err != nil {
+		h.log.Error().Err(err).Msg("feedback: list")
+		httpserver.WriteError(w, http.StatusInternalServerError, "list feedback failed")
+		return
+	}
+	defer rows.Close()
+
+	type feedbackItem struct {
+		ID        string     `json:"id"`
+		Message   string     `json:"message"`
+		Contact   string     `json:"contact"`
+		Rating    *int       `json:"rating"`
+		Context   string     `json:"context"`
+		CreatedAt time.Time  `json:"created_at"`
+		ViewedAt  *time.Time `json:"viewed_at"`
+		Viewed    bool       `json:"viewed"`
+	}
+	out := make([]feedbackItem, 0)
+	for rows.Next() {
+		var it feedbackItem
+		var (
+			viewed sql.NullTime
+			rating sql.NullInt32
+		)
+		if err := rows.Scan(
+			&it.ID, &it.Message, &it.Contact, &rating, &it.Context, &it.CreatedAt, &viewed,
+		); err != nil {
+			h.log.Error().Err(err).Msg("feedback: scan")
+			httpserver.WriteError(w, http.StatusInternalServerError, "list feedback failed")
+			return
+		}
+		if rating.Valid {
+			v := int(rating.Int32)
+			it.Rating = &v
+		}
+		if viewed.Valid {
+			t := viewed.Time
+			it.ViewedAt = &t
+			it.Viewed = true
+		}
+		out = append(out, it)
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Feedback []feedbackItem `json:"feedback"`
+	}{Feedback: out})
+}
+
+// markFeedbackRead flags an entry as viewed (idempotent upsert).
+// Usage: POST /debug/feedback/{id}/read
+func (h *Handler) markFeedbackRead(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	_, err = h.db.ExecContext(r.Context(),
+		`INSERT INTO feedback_read (feedback_id, viewed_at)
+		 VALUES ($1, now())
+		 ON CONFLICT (feedback_id) DO UPDATE SET viewed_at = now()`, id)
+	if err != nil {
+		h.log.Error().Err(err).Msg("feedback: mark read")
+		httpserver.WriteError(w, http.StatusInternalServerError, "mark read failed")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Viewed bool `json:"viewed"`
+	}{Viewed: true})
+}
+
+// markFeedbackUnread clears the viewed flag again.
+// Usage: DELETE /debug/feedback/{id}/read
+func (h *Handler) markFeedbackUnread(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := h.db.ExecContext(r.Context(),
+		`DELETE FROM feedback_read WHERE feedback_id = $1`, id); err != nil {
+		h.log.Error().Err(err).Msg("feedback: mark unread")
+		httpserver.WriteError(w, http.StatusInternalServerError, "mark unread failed")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Viewed bool `json:"viewed"`
+	}{Viewed: false})
+}
+
+// getRetention reports the configured retention window and how much per-tile
+// data is currently past it. Usage: GET /debug/retention
+func (h *Handler) getRetention(w http.ResponseWriter, r *http.Request) {
+	days := retention.RetentionDays(r.Context(), h.db)
+	st, err := retention.CountEligible(r.Context(), h.db, days)
+	if err != nil {
+		h.log.Error().Err(err).Msg("retention: count")
+		httpserver.WriteError(w, http.StatusInternalServerError, "count failed")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		RetentionDays int             `json:"retention_days"`
+		Eligible      retention.Stats `json:"eligible"`
+	}{RetentionDays: days, Eligible: st})
+}
+
+// setRetention changes the retention window (days >= 1).
+// Usage: PUT /debug/retention {"days": 30}
+func (h *Handler) setRetention(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Days int `json:"days"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Days < 1 {
+		httpserver.WriteError(w, http.StatusBadRequest, "days must be >= 1")
+		return
+	}
+	if body.Days > 3650 {
+		httpserver.WriteError(w, http.StatusBadRequest, "retention too long")
+		return
+	}
+	if err := appsettings.SetTileRetentionDays(r.Context(), h.db, body.Days); err != nil {
+		h.log.Error().Err(err).Msg("retention: set")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		RetentionDays int `json:"retention_days"`
+	}{RetentionDays: body.Days})
+}
+
+// purgeRetention runs the purge immediately and returns what was removed.
+// Usage: POST /debug/retention/purge
+func (h *Handler) purgeRetention(w http.ResponseWriter, r *http.Request) {
+	days := retention.RetentionDays(r.Context(), h.db)
+	st, err := retention.Purge(r.Context(), h.db, h.store, h.log, days)
+	if err != nil {
+		h.log.Error().Err(err).Msg("retention: purge")
+		httpserver.WriteError(w, http.StatusInternalServerError, "purge failed")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Purged retention.Stats `json:"purged"`
+	}{Purged: st})
 }
 
 // getPeriodDuration returns the configured global period length in hours, or

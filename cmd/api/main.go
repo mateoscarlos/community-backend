@@ -12,6 +12,7 @@ import (
 	"github.com/community-app/community-backend/internal/modules/debug"
 	"github.com/community-app/community-backend/internal/modules/feedback"
 	"github.com/community-app/community-backend/internal/modules/grid"
+	"github.com/community-app/community-backend/internal/modules/retention"
 	"github.com/community-app/community-backend/internal/modules/submission"
 	"github.com/community-app/community-backend/internal/shared/httpserver"
 	"github.com/community-app/community-backend/internal/shared/logger"
@@ -48,6 +49,7 @@ func main() {
 		fx.Options(claim.Module),
 		fx.Options(submission.Module),
 		fx.Options(feedback.Module),
+		fx.Options(retention.Module),
 		fx.Options(debug.Module),
 		fx.Invoke(startServer),
 	).Run()

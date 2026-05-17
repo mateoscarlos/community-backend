@@ -16,6 +16,14 @@ import (
 // closes it and composes the final mosaic. Unset → legacy daily cutoff.
 const KeyPeriodDurationHours = "period_duration_hours"
 
+// KeyTileRetentionDays controls how long after a period ends its per-tile
+// rows (tiles/claims/submissions) are kept before the retention sweeper
+// purges them. Unset → DefaultTileRetentionDays.
+const KeyTileRetentionDays = "tile_retention_days"
+
+// DefaultTileRetentionDays is the fallback retention window (~1 month).
+const DefaultTileRetentionDays = 30
+
 // Get returns the raw string value for a key, ok=false if it's not set.
 func Get(ctx context.Context, db *sql.DB, key string) (string, bool, error) {
 	var v string
@@ -60,4 +68,26 @@ func PeriodDuration(ctx context.Context, db *sql.DB) (time.Duration, bool) {
 func SetPeriodDurationHours(ctx context.Context, db *sql.DB, hours float64) error {
 	return Set(ctx, db, KeyPeriodDurationHours,
 		strconv.FormatFloat(hours, 'f', -1, 64))
+}
+
+// TileRetentionDays returns the configured retention window in days, falling
+// back to DefaultTileRetentionDays when unset or invalid. Always >= 1.
+func TileRetentionDays(ctx context.Context, db *sql.DB) int {
+	raw, found, err := Get(ctx, db, KeyTileRetentionDays)
+	if err != nil || !found {
+		return DefaultTileRetentionDays
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days < 1 {
+		return DefaultTileRetentionDays
+	}
+	return days
+}
+
+// SetTileRetentionDays stores the retention window in days (>= 1).
+func SetTileRetentionDays(ctx context.Context, db *sql.DB, days int) error {
+	if days < 1 {
+		days = 1
+	}
+	return Set(ctx, db, KeyTileRetentionDays, strconv.Itoa(days))
 }

@@ -28,17 +28,30 @@ func (h *Handler) submit(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Message string `json:"message"`
 		Contact string `json:"contact"`
+		Rating  *int   `json:"rating"`
+		Context string `json:"context"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if body.Message == "" {
-		httpserver.WriteError(w, http.StatusBadRequest, "message is required")
+	// A one-tap reaction carries a rating with no message; a written note
+	// carries a message. Require at least one of them.
+	if body.Rating != nil && (*body.Rating < 1 || *body.Rating > 3) {
+		httpserver.WriteError(w, http.StatusBadRequest, "rating must be 1, 2, or 3")
 		return
 	}
+	if body.Message == "" && body.Rating == nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "message or rating is required")
+		return
+	}
+	// Keep the context tag short and bounded — it's a server-trusted enum-ish
+	// label, not free text.
+	if len(body.Context) > 64 {
+		body.Context = body.Context[:64]
+	}
 
-	fb, err := h.svc.Submit(r.Context(), body.Message, body.Contact)
+	fb, err := h.svc.Submit(r.Context(), body.Message, body.Contact, body.Rating, body.Context)
 	if err != nil {
 		h.log.Error().Err(err).Msg("submit feedback")
 		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
