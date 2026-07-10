@@ -94,6 +94,12 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Get("/period-duration", h.getPeriodDuration)
 		r.Put("/period-duration", h.setPeriodDuration)
 
+		// Concentric-ring progression + outer-tile render mode (M5).
+		r.Get("/phase-grid-sizes", h.getPhaseGridSizes)
+		r.Put("/phase-grid-sizes", h.setPhaseGridSizes)
+		r.Get("/outer-tile-display", h.getOuterTileDisplay)
+		r.Put("/outer-tile-display", h.setOuterTileDisplay)
+
 		// Feedback inbox (admin only).
 		r.Get("/feedback", h.listFeedback)
 		r.Post("/feedback/{id}/read", h.markFeedbackRead)
@@ -316,6 +322,71 @@ func (h *Handler) setPeriodDuration(w http.ResponseWriter, r *http.Request) {
 	httpserver.WriteJSON(w, http.StatusOK, struct {
 		Hours *float64 `json:"hours"`
 	}{Hours: out})
+}
+
+// getPhaseGridSizes returns the current ring progression as an int array.
+// Always returns the validated in-effect value (falls back to the default on
+// bad DB state — see appsettings.PhaseGridSizes).
+// Usage: GET /debug/phase-grid-sizes
+func (h *Handler) getPhaseGridSizes(w http.ResponseWriter, r *http.Request) {
+	sizes := appsettings.PhaseGridSizes(r.Context(), h.db)
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Sizes []int `json:"sizes"`
+	}{Sizes: sizes})
+}
+
+// setPhaseGridSizes stores a new ring progression. The array must be strictly
+// increasing odd ints with the first >= 3. Only affects periods created *after*
+// the change — a running period keeps the shape it was seeded with. See
+// docs/game-model-rework.md §M5.
+// Usage: PUT /debug/phase-grid-sizes {"sizes": [3, 5, 7, 9]}
+func (h *Handler) setPhaseGridSizes(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Sizes []int `json:"sizes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := appsettings.SetPhaseGridSizes(r.Context(), h.db, body.Sizes); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Sizes []int `json:"sizes"`
+	}{Sizes: body.Sizes})
+}
+
+// getOuterTileDisplay returns the current outer-tile render mode.
+// Usage: GET /debug/outer-tile-display
+func (h *Handler) getOuterTileDisplay(w http.ResponseWriter, r *http.Request) {
+	mode := appsettings.OuterTileDisplay(r.Context(), h.db)
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Mode string `json:"mode"`
+	}{Mode: mode})
+}
+
+// setOuterTileDisplay stores the outer-tile render mode. Applies to the next
+// /periods/current response — clients receive it inline. Live periods pick it
+// up on their next poll without a rotation.
+// Usage: PUT /debug/outer-tile-display {"mode": "hidden"}
+func (h *Handler) setOuterTileDisplay(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := appsettings.SetOuterTileDisplay(r.Context(), h.db, body.Mode); err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Nudge clients to refetch immediately so a live toggle re-renders.
+	h.broker.PublishPeriodUpdated()
+	httpserver.WriteJSON(w, http.StatusOK, struct {
+		Mode string `json:"mode"`
+	}{Mode: body.Mode})
 }
 
 // recomposeArchives backfills final mosaic images for completed periods that
