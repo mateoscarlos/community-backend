@@ -554,19 +554,34 @@ last phase reached.
 
 ## 6 · Rollout / legacy
 
-Locked decision: **fresh dev DB**. Nothing to migrate.
+The dev environment was fresh-started. The migrations were later hardened
+to apply cleanly against production data too — the first prod deploy
+tripped on a database that had two active periods (one photo, one prompt)
+and thousands of per-phase tile rows, neither of which fit the new
+constraints as originally written.
 
-Practically that means, when M1 is ready to review:
+What the migrations do on any real database:
 
-1. Push M1's migrations.
-2. On the dev environment: `psql` in and `TRUNCATE periods, tiles,
-   daily_images, daily_image_schedule CASCADE` (or drop-and-recreate the
-   database — the `migrate down` path is not maintained for this pivot).
-3. Re-schedule content via `POST /debug/schedule`.
+- `00022` closes every active period (`status='completed'` + `ended_at=now()`)
+  before enforcing the single-active unique index. The `prompt` column is
+  dropped; legacy prompt periods keep their `game_type='prompt'` so the
+  Museum still lists them, but the prompt text is lost — the archive UI
+  reads mosaics + dates, so this is acceptable. `daily_image_id` stays
+  nullable and a CHECK guards active rows from missing an image.
+- `00024` deletes every existing `tiles`, `claims`, and `submissions` row
+  before applying the new one-tile-per-position unique constraint. Legacy
+  tiles carry per-phase semantics that don't fit the new model, and the
+  composed mosaics on `period_mosaics` are the actual archive artefact
+  (raw tile rows aren't user-visible). The next rotation seeds a fresh
+  period under the new model.
 
-If someone finds this doc after the pivot has shipped and there are real
-periods in the DB, the migration path is out of scope of this doc — talk
-to the user first.
+Nothing in the archive UI is lost — periods and their mosaics stay
+intact. What is lost: any in-progress tiles at the moment of migration
+(claims, un-composed submissions). If prod has an active round mid-play,
+warn users before rolling out.
+
+For a fresh dev DB the migrations behave the same way (the DELETEs
+target empty tables, the UPDATE hits zero rows).
 
 ## 7 · What's explicitly NOT in scope
 
