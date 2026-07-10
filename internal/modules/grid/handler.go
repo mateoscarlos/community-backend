@@ -196,15 +196,16 @@ func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (
 	phaseWindow := PhaseWindowSize(current.Period.Phase, current.PhaseSizes)
 
 	pi := periodInfo{
-		ID:            current.Period.ID.String(),
-		GameType:      current.Period.GameType,
-		Status:        string(current.Period.Status),
-		Phase:         current.Period.Phase,
-		FinalGridSize: current.Period.FinalGridSize,
-		PhaseGridSize: phaseWindow,
-		StartedAt:     current.Period.StartedAt,
-		Image:         imageResp,
-		PhaseMosaics:  mosaicResps,
+		ID:             current.Period.ID.String(),
+		GameType:       current.Period.GameType,
+		Status:         string(current.Period.Status),
+		Phase:          current.Period.Phase,
+		FinalGridSize:  current.Period.FinalGridSize,
+		PhaseGridSize:  phaseWindow,
+		PhaseGridSizes: current.PhaseSizes,
+		StartedAt:      current.Period.StartedAt,
+		Image:          imageResp,
+		PhaseMosaics:   mosaicResps,
 	}
 	if current.NextPeriodStartsAt != nil {
 		pi.NextPeriodStartsAt = current.NextPeriodStartsAt
@@ -216,9 +217,13 @@ func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (
 			OuterTileDisplay: current.OuterDisplay,
 			Columns:          current.Period.FinalGridSize,
 			Rows:             current.Period.FinalGridSize,
-			TotalTiles:       len(current.Tiles),
-			DrawnCount:       int(current.DrawnCount),
-			Tiles:            tiles,
+			// TotalTiles is scoped to the currently-playable window (matches
+			// DrawnCount's scope), not the whole final grid, so "X/Y drawn"
+			// reads as progress against the current ring. Future-locked
+			// tiles are counted only when their ring unlocks.
+			TotalTiles: int(current.TotalCount),
+			DrawnCount: int(current.DrawnCount),
+			Tiles:      tiles,
 		},
 	}, nil
 }
@@ -231,12 +236,16 @@ type periodResponse struct {
 }
 
 type periodInfo struct {
-	ID                 string                `json:"id"`
-	GameType           string                `json:"game_type"`
-	Status             string                `json:"status"`
-	Phase              int                   `json:"phase"`
-	FinalGridSize      int                   `json:"final_grid_size"`
-	PhaseGridSize      int                   `json:"phase_grid_size"`
+	ID            string `json:"id"`
+	GameType      string `json:"game_type"`
+	Status        string `json:"status"`
+	Phase         int    `json:"phase"`
+	FinalGridSize int    `json:"final_grid_size"`
+	PhaseGridSize int    `json:"phase_grid_size"`
+	// PhaseGridSizes is the full ring progression the frontend uses to size
+	// the phase indicator (one pip per entry). Configurable per period at
+	// creation (via app_settings.phase_grid_sizes).
+	PhaseGridSizes     []int                 `json:"phase_grid_sizes"`
 	StartedAt          time.Time             `json:"started_at"`
 	NextPeriodStartsAt *time.Time            `json:"next_period_starts_at,omitempty"`
 	Image              *imageResponse        `json:"image,omitempty"`
