@@ -167,7 +167,7 @@ func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, stora
 
 	// Check if this completes the phase. Errors are logged, not propagated —
 	// the submission itself already succeeded. Look up the period via the
-	// tile so we apply phase logic to the correct game (photo vs prompt).
+	// Trigger phase-advance / masterpiece-complete side effects, if any.
 	period, err := s.gridSvc.GetPeriodByTileID(ctx, tileID)
 	if err == nil {
 		result, err := s.gridSvc.CheckPhaseCompletion(ctx, period.ID)
@@ -176,9 +176,9 @@ func (s *Service) Submit(ctx context.Context, tileID uuid.UUID, sessionID, stora
 		} else {
 			switch result {
 			case grid.PhaseAdvanced:
-				s.broker.PublishPhaseComplete(period.GameType, period.Phase, period.Phase+1, false)
+				s.broker.PublishPhaseComplete(period.Phase, period.Phase+1, false)
 			case grid.PhaseAllComplete:
-				s.broker.PublishPhaseComplete(period.GameType, period.Phase, 0, true)
+				s.broker.PublishPhaseComplete(period.Phase, 0, true)
 			}
 		}
 	}

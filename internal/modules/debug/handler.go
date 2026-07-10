@@ -90,11 +90,6 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Post("/schedule", h.upsertSchedule)
 		r.Delete("/schedule/{date}", h.deleteSchedule)
 
-		// Prompt schedule (parallel prompt-game).
-		r.Get("/prompt-schedule", h.listPromptSchedule)
-		r.Post("/prompt-schedule", h.upsertPromptSchedule)
-		r.Delete("/prompt-schedule/{date}", h.deletePromptSchedule)
-
 		// Global period duration knob.
 		r.Get("/period-duration", h.getPeriodDuration)
 		r.Put("/period-duration", h.setPeriodDuration)
@@ -401,72 +396,35 @@ func (h *Handler) setActiveDailyImage(w http.ResponseWriter, r *http.Request) {
 	httpserver.WriteJSON(w, http.StatusOK, img)
 }
 
-// createPeriod creates an active period for either game.
+// createPeriod creates an active period from the currently-active daily image.
 // Usage: POST /debug/period
-//
-//	{"game_type": "photo"}                       — uses active daily image
-//	{"game_type": "prompt", "prompt": "an elephant riding a bike"}
 func (h *Handler) createPeriod(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		GameType string `json:"game_type"`
-		Prompt   string `json:"prompt"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		body.GameType = "photo"
-	}
-	if body.GameType == "" {
-		body.GameType = "photo"
-	}
+	// Consume any body so we don't leak the connection, but ignore it — the
+	// endpoint takes no params now that game_type is gone.
+	_ = json.NewDecoder(r.Body).Decode(&struct{}{})
 
-	switch grid.GameType(body.GameType) {
-	case grid.GamePhoto:
-		img, err := h.repo.GetActive(r.Context())
-		if err != nil {
-			httpserver.WriteError(w, http.StatusBadRequest, "no active daily image — set one first")
-			return
-		}
-		period, err := h.gridSvc.CreatePhotoPeriod(r.Context(), img.ID)
-		if err != nil {
-			h.log.Error().Err(err).Msg("create debug photo period")
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-		httpserver.WriteJSON(w, http.StatusCreated, period)
-	case grid.GamePrompt:
-		if body.Prompt == "" {
-			httpserver.WriteError(w, http.StatusBadRequest, "prompt is required for prompt-game periods")
-			return
-		}
-		period, err := h.gridSvc.CreatePromptPeriod(r.Context(), body.Prompt)
-		if err != nil {
-			h.log.Error().Err(err).Msg("create debug prompt period")
-			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-		httpserver.WriteJSON(w, http.StatusCreated, period)
-	default:
-		httpserver.WriteError(w, http.StatusBadRequest, "invalid game_type")
+	img, err := h.repo.GetActive(r.Context())
+	if err != nil {
+		httpserver.WriteError(w, http.StatusBadRequest, "no active daily image — set one first")
+		return
 	}
+	period, err := h.gridSvc.CreatePhotoPeriod(r.Context(), img.ID)
+	if err != nil {
+		h.log.Error().Err(err).Msg("create debug period")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusCreated, period)
 }
 
 // deletePeriod deletes the active period and all its tiles, claims, and submissions.
-// Usage: DELETE /debug/period?game_type=photo
+// Usage: DELETE /debug/period
 func (h *Handler) deletePeriod(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	gameType := grid.GameType(r.URL.Query().Get("game_type"))
-	if gameType == "" {
-		gameType = grid.GamePhoto
-	}
-	if !gameType.Valid() {
-		httpserver.WriteError(w, http.StatusBadRequest, "invalid game_type")
-		return
-	}
-
 	var periodID uuid.UUID
 	err := h.db.QueryRowContext(ctx,
-		`SELECT id FROM periods WHERE status = 'active' AND game_type = $1 LIMIT 1`,
-		string(gameType),
+		`SELECT id FROM periods WHERE status = 'active' LIMIT 1`,
 	).Scan(&periodID)
 	if err != nil {
 		httpserver.WriteError(w, http.StatusNotFound, "no active period")
@@ -495,26 +453,17 @@ func (h *Handler) deletePeriod(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// resetPeriod resets the active period: deletes all submissions and claims, resets all tiles to free, resets phase to 1.
-// Usage: POST /debug/period/reset?game_type=photo
+// resetPeriod resets the active period: deletes all submissions and claims,
+// resets all tiles to free, restores the phase_locked flag on every tile that
+// isn't in the phase-1 center, and rewinds period.phase to 1.
+// Usage: POST /debug/period/reset
 func (h *Handler) resetPeriod(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	gameType := grid.GameType(r.URL.Query().Get("game_type"))
-	if gameType == "" {
-		gameType = grid.GamePhoto
-	}
-	if !gameType.Valid() {
-		httpserver.WriteError(w, http.StatusBadRequest, "invalid game_type")
-		return
-	}
-
 	var periodID uuid.UUID
-	var currentPhase int32
 	err := h.db.QueryRowContext(ctx,
-		`SELECT id, phase FROM periods WHERE status = 'active' AND game_type = $1 LIMIT 1`,
-		string(gameType),
-	).Scan(&periodID, &currentPhase)
+		`SELECT id FROM periods WHERE status = 'active' LIMIT 1`,
+	).Scan(&periodID)
 	if err != nil {
 		httpserver.WriteError(w, http.StatusNotFound, "no active period")
 		return
@@ -527,7 +476,7 @@ func (h *Handler) resetPeriod(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// Delete submissions and claims for all tiles in this period (all phases)
+	// Wipe every drawing and claim on this period.
 	queries := []string{
 		`DELETE FROM submissions WHERE tile_id IN (SELECT id FROM tiles WHERE period_id = $1)`,
 		`DELETE FROM claims WHERE tile_id IN (SELECT id FROM tiles WHERE period_id = $1)`,
@@ -540,16 +489,10 @@ func (h *Handler) resetPeriod(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Delete tiles from phases > 1
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tiles WHERE period_id = $1 AND phase > 1`, periodID); err != nil {
-		h.log.Error().Err(err).Msg("reset period: delete higher phase tiles")
-		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
-		return
-	}
-
-	// Reset remaining phase 1 tiles to free
+	// Every tile back to 'free'; re-lock every ring beyond phase 1 so the
+	// period walks back through its normal advance path.
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE tiles SET status = 'free', updated_at = now() WHERE period_id = $1 AND phase = 1`,
+		`UPDATE tiles SET status = 'free', phase_locked = (phase > 1), updated_at = now() WHERE period_id = $1`,
 		periodID,
 	); err != nil {
 		h.log.Error().Err(err).Msg("reset period: reset tiles")
@@ -557,7 +500,6 @@ func (h *Handler) resetPeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reset period phase to 1
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE periods SET phase = 1, ended_at = NULL, status = 'active', updated_at = now() WHERE id = $1`,
 		periodID,
@@ -574,8 +516,7 @@ func (h *Handler) resetPeriod(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info().Str("period_id", periodID.String()).Msg("reset period to phase 1 (debug)")
 
-	// Notify SSE clients of the affected game to refetch.
-	h.broker.PublishPhaseComplete(string(gameType), 0, 1, false)
+	h.broker.PublishPeriodUpdated()
 
 	httpserver.WriteJSON(w, http.StatusOK, map[string]string{
 		"reset":   periodID.String(),
@@ -641,16 +582,7 @@ func (h *Handler) resetTile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	gameType := grid.GameType(r.URL.Query().Get("game_type"))
-	if gameType == "" {
-		gameType = grid.GamePhoto
-	}
-	if !gameType.Valid() {
-		httpserver.WriteError(w, http.StatusBadRequest, "invalid game_type")
-		return
-	}
-
-	period, err := h.gridSvc.GetActivePeriod(ctx, gameType)
+	period, err := h.gridSvc.GetActivePeriod(ctx)
 	if err != nil {
 		httpserver.WriteError(w, http.StatusNotFound, "no active period")
 		return
@@ -662,9 +594,12 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 		col int
 	}
 
+	// Only draw tiles in the currently-unlocked window (phase <= current AND
+	// not phase_locked). Ring-locked tiles stay untouched so the ring-unlock
+	// advance path still runs on the following draw-all.
 	rows, err := h.db.QueryContext(ctx,
 		`SELECT id, row_index, col_index FROM tiles
-		 WHERE period_id = $1 AND phase = $2 AND status != 'drawn'`,
+		 WHERE period_id = $1 AND phase <= $2 AND phase_locked = FALSE AND status != 'drawn'`,
 		period.ID, period.Phase,
 	)
 	if err != nil {
@@ -783,9 +718,9 @@ func (h *Handler) drawAllTiles(w http.ResponseWriter, r *http.Request) {
 	} else {
 		switch result {
 		case grid.PhaseAdvanced:
-			h.broker.PublishPhaseComplete(period.GameType, period.Phase, period.Phase+1, false)
+			h.broker.PublishPhaseComplete(period.Phase, period.Phase+1, false)
 		case grid.PhaseAllComplete:
-			h.broker.PublishPhaseComplete(period.GameType, period.Phase, 0, true)
+			h.broker.PublishPhaseComplete(period.Phase, 0, true)
 		}
 	}
 
@@ -880,11 +815,11 @@ func (h *Handler) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If admin scheduled an image for today, kick off rotation immediately so
-	// the photo game becomes playable without a manual "Create Period" step.
+	// the game becomes playable without a manual "Create Period" step.
 	// Idempotent: rotateForToday bails if a period for today already exists.
 	if isTodayInCph(date) {
-		if err := h.gridSvc.RotateForToday(r.Context(), grid.GamePhoto); err != nil {
-			h.log.Warn().Err(err).Msg("schedule: rotate today (photo)")
+		if err := h.gridSvc.RotateForToday(r.Context()); err != nil {
+			h.log.Warn().Err(err).Msg("schedule: rotate today")
 		}
 	}
 
@@ -915,101 +850,6 @@ func (h *Handler) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// listPromptSchedule returns the upcoming N days of scheduled prompts.
-// Usage: GET /debug/prompt-schedule
-func (h *Handler) listPromptSchedule(w http.ResponseWriter, r *http.Request) {
-	loc, err := time.LoadLocation(grid.PeriodTimezone)
-	if err != nil {
-		httpserver.WriteError(w, http.StatusInternalServerError, "load timezone failed")
-		return
-	}
-	now := time.Now().In(loc)
-	y, m, d := now.Date()
-	from := time.Date(y, m, d, 0, 0, 0, 0, loc)
-	to := from.AddDate(0, 0, scheduleListWindowDays-1)
-
-	rows, err := h.repo.ListPromptSchedule(r.Context(), from, to)
-	if err != nil {
-		h.log.Error().Err(err).Msg("prompt schedule: list")
-		httpserver.WriteError(w, http.StatusInternalServerError, "list prompt schedule failed")
-		return
-	}
-
-	type item struct {
-		Date   string `json:"date"`
-		Prompt string `json:"prompt"`
-	}
-	out := make([]item, len(rows))
-	for i, row := range rows {
-		out[i] = item{
-			Date:   row.Date.Format("2006-01-02"),
-			Prompt: row.Prompt,
-		}
-	}
-
-	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
-		"from":  from.Format("2006-01-02"),
-		"to":    to.Format("2006-01-02"),
-		"items": out,
-	})
-}
-
-// upsertPromptSchedule registers (or replaces) a scheduled prompt for a date.
-// Usage: POST /debug/prompt-schedule
-//
-//	{"date": "2026-05-10", "prompt": "an elephant riding a bike"}
-func (h *Handler) upsertPromptSchedule(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Date   string `json:"date"`
-		Prompt string `json:"prompt"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpserver.WriteError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if body.Date == "" || body.Prompt == "" {
-		httpserver.WriteError(w, http.StatusBadRequest, "date and prompt are required")
-		return
-	}
-	date, err := time.Parse("2006-01-02", body.Date)
-	if err != nil {
-		httpserver.WriteError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
-		return
-	}
-
-	saved, err := h.repo.UpsertScheduledPrompt(r.Context(), date, body.Prompt)
-	if err != nil {
-		h.log.Error().Err(err).Msg("prompt schedule: upsert")
-		httpserver.WriteError(w, http.StatusInternalServerError, "upsert prompt schedule failed")
-		return
-	}
-
-	if isTodayInCph(date) {
-		// Two cases: no period for today yet → create it from the schedule;
-		// or one is already running → RotateForToday is a no-op, so push the
-		// new prompt onto the live period in place and tell clients to refetch
-		// (otherwise an edited prompt never shows until the next rotation).
-		if err := h.gridSvc.RotateForToday(r.Context(), grid.GamePrompt); err != nil {
-			h.log.Warn().Err(err).Msg("prompt schedule: rotate today")
-		}
-		if period, err := h.gridSvc.GetActivePeriod(r.Context(), grid.GamePrompt); err == nil {
-			if _, err := h.db.ExecContext(r.Context(),
-				`UPDATE periods SET prompt = $1, updated_at = now() WHERE id = $2`,
-				body.Prompt, period.ID,
-			); err != nil {
-				h.log.Error().Err(err).Msg("prompt schedule: update live period prompt")
-			} else {
-				h.broker.PublishPeriodUpdated(string(grid.GamePrompt))
-			}
-		}
-	}
-
-	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
-		"date":   saved.Date.Format("2006-01-02"),
-		"prompt": saved.Prompt,
-	})
-}
-
 // isTodayInCph reports whether the given date refers to today's calendar
 // date in the period timezone — used to decide if a freshly-scheduled entry
 // should auto-rotate immediately rather than wait for the midnight sweeper.
@@ -1021,25 +861,6 @@ func isTodayInCph(date time.Time) bool {
 	now := time.Now().In(loc)
 	d := date.In(loc)
 	return now.Year() == d.Year() && now.Month() == d.Month() && now.Day() == d.Day()
-}
-
-// deletePromptSchedule removes a scheduled prompt for a given date.
-// Usage: DELETE /debug/prompt-schedule/2026-05-10
-func (h *Handler) deletePromptSchedule(w http.ResponseWriter, r *http.Request) {
-	dateStr := chi.URLParam(r, "date")
-	date, err := time.Parse("2006-01-02", dateStr)
-	if err != nil {
-		httpserver.WriteError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
-		return
-	}
-
-	if err := h.repo.DeleteScheduledPromptByDate(r.Context(), date); err != nil {
-		h.log.Error().Err(err).Msg("prompt schedule: delete")
-		httpserver.WriteError(w, http.StatusInternalServerError, "delete prompt schedule failed")
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // listSessions returns one row per distinct session_id ever to claim a tile,

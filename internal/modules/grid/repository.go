@@ -17,24 +17,29 @@ func nullString(s string) sql.NullString {
 
 var (
 	ErrPeriodNotFound = errors.New("active period not found")
-	ErrGridNotFound   = errors.New("grid config not found")
 )
 
 type Repository interface {
-	GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error)
+	GetActivePeriod(ctx context.Context) (*Period, error)
+	GetLatestCompletedPeriod(ctx context.Context) (*Period, error)
 	GetPeriodByID(ctx context.Context, id uuid.UUID) (*Period, error)
 	GetPeriodByTileID(ctx context.Context, tileID uuid.UUID) (*Period, error)
-	ListCompletedPeriods(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error)
+	ListCompletedPeriods(ctx context.Context, limit, offset int) ([]Period, error)
 	ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]Period, error)
-	CreatePeriod(ctx context.Context, dailyImageID *uuid.UUID, gameType GameType, status PeriodStatus, phase int, prompt string) (*Period, error)
+	CreatePeriod(ctx context.Context, dailyImageID uuid.UUID, status PeriodStatus, phase, finalGridSize int) (*Period, error)
 	UpdatePeriodPhase(ctx context.Context, id uuid.UUID, phase int) error
 	CompletePeriod(ctx context.Context, id uuid.UUID) error
 	SetPeriodFinalImage(ctx context.Context, id uuid.UUID, finalImageKey string) error
-	GetGridConfig(ctx context.Context, phase int) (*GridConfig, error)
-	GetTilesByPeriodAndPhase(ctx context.Context, periodID uuid.UUID, phase int) ([]Tile, error)
-	CreateTile(ctx context.Context, periodID uuid.UUID, phase, row, col int) (*Tile, error)
+	GetTilesByPeriod(ctx context.Context, periodID uuid.UUID) ([]Tile, error)
+	CreateTile(ctx context.Context, periodID uuid.UUID, phase, row, col int, phaseLocked bool) (*Tile, error)
 	UpdateTileStatus(ctx context.Context, id uuid.UUID, status TileStatus) error
-	CountTilesByStatus(ctx context.Context, periodID uuid.UUID, phase int) (drawnCount, totalCount int64, err error)
+	// UnlockPhaseRing flips phase_locked=FALSE for every tile at the given
+	// phase. Called on phase advance to make the newly-unlocked ring playable
+	// while leaving earlier-phase drawings untouched.
+	UnlockPhaseRing(ctx context.Context, periodID uuid.UUID, phase int) error
+	// CountTilesUpToPhase counts tiles in the currently-playable window
+	// (phase <= upToPhase and phase_locked=false).
+	CountTilesUpToPhase(ctx context.Context, periodID uuid.UUID, upToPhase int) (drawnCount, totalCount int64, err error)
 
 	UpsertPeriodMosaic(ctx context.Context, periodID uuid.UUID, phase int, storageKey string) error
 	ListMosaicsByPeriod(ctx context.Context, periodID uuid.UUID) ([]PhaseMosaic, error)
@@ -48,13 +53,24 @@ func NewPostgresRepository(sqlDB *sql.DB) Repository {
 	return &postgresRepository{queries: griddb.New(sqlDB)}
 }
 
-func (r *postgresRepository) GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error) {
-	row, err := r.queries.GetActivePeriod(ctx, string(gameType))
+func (r *postgresRepository) GetActivePeriod(ctx context.Context) (*Period, error) {
+	row, err := r.queries.GetActivePeriod(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPeriodNotFound
 		}
 		return nil, fmt.Errorf("get active period: %w", err)
+	}
+	return periodToDomain(row), nil
+}
+
+func (r *postgresRepository) GetLatestCompletedPeriod(ctx context.Context) (*Period, error) {
+	row, err := r.queries.GetLatestCompletedPeriod(ctx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrPeriodNotFound
+		}
+		return nil, fmt.Errorf("get latest completed period: %w", err)
 	}
 	return periodToDomain(row), nil
 }
@@ -81,11 +97,10 @@ func (r *postgresRepository) GetPeriodByTileID(ctx context.Context, tileID uuid.
 	return periodToDomain(row), nil
 }
 
-func (r *postgresRepository) ListCompletedPeriods(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error) {
+func (r *postgresRepository) ListCompletedPeriods(ctx context.Context, limit, offset int) ([]Period, error) {
 	rows, err := r.queries.ListCompletedPeriods(ctx, griddb.ListCompletedPeriodsParams{
-		GameType: string(gameType),
-		Limit:    int32(limit),
-		Offset:   int32(offset),
+		Limit:  int32(limit),
+		Offset: int32(offset),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list completed periods: %w", err)
@@ -109,17 +124,12 @@ func (r *postgresRepository) ListCompletedPeriodsMissingFinalImage(ctx context.C
 	return periods, nil
 }
 
-func (r *postgresRepository) CreatePeriod(ctx context.Context, dailyImageID *uuid.UUID, gameType GameType, status PeriodStatus, phase int, prompt string) (*Period, error) {
-	var imgID uuid.NullUUID
-	if dailyImageID != nil {
-		imgID = uuid.NullUUID{UUID: *dailyImageID, Valid: true}
-	}
+func (r *postgresRepository) CreatePeriod(ctx context.Context, dailyImageID uuid.UUID, status PeriodStatus, phase, finalGridSize int) (*Period, error) {
 	row, err := r.queries.CreatePeriod(ctx, griddb.CreatePeriodParams{
-		DailyImageID: imgID,
-		GameType:     string(gameType),
-		Status:       string(status),
-		Phase:        int32(phase),
-		Prompt:       nullString(prompt),
+		DailyImageID:  uuid.NullUUID{UUID: dailyImageID, Valid: true},
+		Status:        string(status),
+		Phase:         int32(phase),
+		FinalGridSize: int32(finalGridSize),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create period: %w", err)
@@ -167,31 +177,8 @@ func (r *postgresRepository) ListMosaicsByPeriod(ctx context.Context, periodID u
 	return out, nil
 }
 
-func (r *postgresRepository) GetGridConfig(ctx context.Context, phase int) (*GridConfig, error) {
-	row, err := r.queries.GetGridConfig(ctx, int32(phase))
-	if err == nil {
-		return gridConfigToDomain(row), nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("get grid config: %w", err)
-	}
-
-	// No row stored for this phase — fall back to a formula so the grid keeps
-	// subdividing forever. Triangular: cols(p) = (p+1)(p+2)/2. Matches the
-	// seeded values exactly (p=1→3, p=2→6, p=3→10) and grows quadratically:
-	// p=4→15, p=5→21, p=6→28, p=10→66, p=20→231.
-	if phase < 1 {
-		return nil, ErrGridNotFound
-	}
-	size := (phase + 1) * (phase + 2) / 2
-	return &GridConfig{Phase: phase, Columns: size, Rows: size}, nil
-}
-
-func (r *postgresRepository) GetTilesByPeriodAndPhase(ctx context.Context, periodID uuid.UUID, phase int) ([]Tile, error) {
-	rows, err := r.queries.GetTilesByPeriodAndPhase(ctx, griddb.GetTilesByPeriodAndPhaseParams{
-		PeriodID: periodID,
-		Phase:    int32(phase),
-	})
+func (r *postgresRepository) GetTilesByPeriod(ctx context.Context, periodID uuid.UUID) ([]Tile, error) {
+	rows, err := r.queries.GetTilesByPeriod(ctx, periodID)
 	if err != nil {
 		return nil, fmt.Errorf("get tiles: %w", err)
 	}
@@ -204,6 +191,7 @@ func (r *postgresRepository) GetTilesByPeriodAndPhase(ctx context.Context, perio
 			RowIndex:      int(row.RowIndex),
 			ColIndex:      int(row.ColIndex),
 			Status:        TileStatus(row.Status),
+			PhaseLocked:   row.PhaseLocked,
 			SubmissionKey: row.SubmissionKey,
 			CreatedAt:     row.CreatedAt,
 			UpdatedAt:     row.UpdatedAt,
@@ -212,12 +200,13 @@ func (r *postgresRepository) GetTilesByPeriodAndPhase(ctx context.Context, perio
 	return tiles, nil
 }
 
-func (r *postgresRepository) CreateTile(ctx context.Context, periodID uuid.UUID, phase, row, col int) (*Tile, error) {
+func (r *postgresRepository) CreateTile(ctx context.Context, periodID uuid.UUID, phase, row, col int, phaseLocked bool) (*Tile, error) {
 	dbRow, err := r.queries.CreateTile(ctx, griddb.CreateTileParams{
-		PeriodID: periodID,
-		Phase:    int32(phase),
-		RowIndex: int32(row),
-		ColIndex: int32(col),
+		PeriodID:    periodID,
+		Phase:       int32(phase),
+		RowIndex:    int32(row),
+		ColIndex:    int32(col),
+		PhaseLocked: phaseLocked,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tile: %w", err)
@@ -232,30 +221,40 @@ func (r *postgresRepository) UpdateTileStatus(ctx context.Context, id uuid.UUID,
 	})
 }
 
-func (r *postgresRepository) CountTilesByStatus(ctx context.Context, periodID uuid.UUID, phase int) (int64, int64, error) {
-	row, err := r.queries.CountTilesByStatus(ctx, griddb.CountTilesByStatusParams{
+func (r *postgresRepository) UnlockPhaseRing(ctx context.Context, periodID uuid.UUID, phase int) error {
+	return r.queries.UnlockPhaseRing(ctx, griddb.UnlockPhaseRingParams{
 		PeriodID: periodID,
 		Phase:    int32(phase),
 	})
+}
+
+func (r *postgresRepository) CountTilesUpToPhase(ctx context.Context, periodID uuid.UUID, upToPhase int) (int64, int64, error) {
+	row, err := r.queries.CountTilesUpToPhase(ctx, griddb.CountTilesUpToPhaseParams{
+		PeriodID: periodID,
+		Phase:    int32(upToPhase),
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("count tiles by status: %w", err)
+		return 0, 0, fmt.Errorf("count tiles up to phase: %w", err)
 	}
 	return row.DrawnCount, row.TotalCount, nil
 }
 
 func periodToDomain(row griddb.Period) *Period {
 	p := &Period{
-		ID:        row.ID,
-		GameType:  row.GameType,
-		Status:    PeriodStatus(row.Status),
-		Phase:     int(row.Phase),
-		StartedAt: row.StartedAt,
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
+		ID:            row.ID,
+		GameType:      row.GameType,
+		Status:        PeriodStatus(row.Status),
+		Phase:         int(row.Phase),
+		FinalGridSize: int(row.FinalGridSize),
+		StartedAt:     row.StartedAt,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
 	}
+	// The DB column is still nullable for backwards compatibility with legacy
+	// schema, but we now insert only non-null image IDs (see M1.5 in
+	// docs/game-model-rework.md).
 	if row.DailyImageID.Valid {
-		id := row.DailyImageID.UUID
-		p.DailyImageID = &id
+		p.DailyImageID = row.DailyImageID.UUID
 	}
 	if row.EndedAt.Valid {
 		p.EndedAt = &row.EndedAt.Time
@@ -266,31 +265,19 @@ func periodToDomain(row griddb.Period) *Period {
 	if row.ComposedAt.Valid {
 		p.ComposedAt = &row.ComposedAt.Time
 	}
-	if row.Prompt.Valid {
-		p.Prompt = row.Prompt.String
-	}
 	return p
 }
 
 func tileToDomain(row griddb.Tile) *Tile {
 	return &Tile{
-		ID:        row.ID,
-		PeriodID:  row.PeriodID,
-		Phase:     int(row.Phase),
-		RowIndex:  int(row.RowIndex),
-		ColIndex:  int(row.ColIndex),
-		Status:    TileStatus(row.Status),
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
-	}
-}
-
-func gridConfigToDomain(row griddb.GridConfig) *GridConfig {
-	return &GridConfig{
-		ID:        row.ID,
-		Phase:     int(row.Phase),
-		Columns:   int(row.Columns),
-		Rows:      int(row.Rows),
-		CreatedAt: row.CreatedAt,
+		ID:          row.ID,
+		PeriodID:    row.PeriodID,
+		Phase:       int(row.Phase),
+		RowIndex:    int(row.RowIndex),
+		ColIndex:    int(row.ColIndex),
+		Status:      TileStatus(row.Status),
+		PhaseLocked: row.PhaseLocked,
+		CreatedAt:   row.CreatedAt,
+		UpdatedAt:   row.UpdatedAt,
 	}
 }

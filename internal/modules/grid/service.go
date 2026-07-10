@@ -19,36 +19,32 @@ import (
 )
 
 const (
-	// maxFullSize caps the longest dimension of a composed full mosaic. Without
-	// this cap the canvas grows quadratically with phase (a 100x100 grid would
-	// be 25,600 px square at the old 256px cell size). 2048 keeps full mosaics
-	// under ~1MB at quality 85 while still preserving per-tile detail through
-	// phase ~6.
+	// maxFullSize caps the longest dimension of a composed full mosaic to keep
+	// upload sizes reasonable across a wide range of final_grid_size settings.
 	maxFullSize = 2048
 
-	// maxFullCellSize bounds the per-cell pixel size for low-phase grids so a
-	// 3x3 phase doesn't get stretched to 2048 px wide.
+	// maxFullCellSize bounds the per-cell pixel size so a small window doesn't
+	// get stretched to 2048 px wide.
 	maxFullCellSize = 256
 
 	// thumbSize is the side of the square thumbnail used by the archive
 	// calendar. Day cells render at ~80-160 CSS pixels; 512 covers high-DPI.
 	thumbSize = 512
 
-	// MaxPhasesPerPeriod is a safety guard against runaway phase advancement.
-	// In practice the period closes long before this from the daily cutoff;
-	// effectively unbounded so the grid keeps subdividing.
-	MaxPhasesPerPeriod = 1_000_000
-
 	// PeriodTimezone is the calendar timezone the daily masterpiece runs on.
 	// A period started during day D in this zone is over the moment it crosses
-	// midnight into D+1 (whichever phase it's currently on).
+	// midnight into D+1 (whichever phase it's currently on) unless a
+	// period_duration_hours override is set in app_settings.
 	PeriodTimezone = "Europe/Copenhagen"
 
 	// composeFetchConcurrency caps in-flight tile downloads during compose.
-	// Object storage round-trips (R2/MinIO) dominate compose latency at high
-	// phase counts; pulling tiles in parallel turns hundreds of sequential
-	// 50ms RTTs into batches.
 	composeFetchConcurrency = 16
+
+	// DefaultFinalGridSize is the fallback for new periods when the app-settings
+	// override isn't set. Chosen so the default phase progression [3,5,7,9] hits
+	// its last phase exactly. Overridable via appsettings once the M5 admin card
+	// lands; for now, periods created from the sweeper use this constant.
+	DefaultFinalGridSize = 9
 )
 
 // ThumbnailKey returns the storage key for the thumbnail variant of a full
@@ -73,6 +69,18 @@ func isPastDailyCutoff(startedAt, now time.Time) bool {
 	return !now.Before(cutoff)
 }
 
+// nextDailyCutoff returns the next Copenhagen midnight strictly after `now`.
+// Used to build the completed-period countdown target.
+func nextDailyCutoff(now time.Time) time.Time {
+	loc, err := time.LoadLocation(PeriodTimezone)
+	if err != nil {
+		return now.Add(24 * time.Hour)
+	}
+	local := now.In(loc)
+	y, m, d := local.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, loc)
+}
+
 type Service struct {
 	repo    Repository
 	imgRepo dailyimage.Repository
@@ -85,11 +93,9 @@ func NewService(repo Repository, imgRepo dailyimage.Repository, store *storage.S
 	return &Service{repo: repo, imgRepo: imgRepo, store: store, db: db, log: log}
 }
 
-// isPastCutoff reports whether the period that started at startedAt should now
-// be closed. If a period duration is configured in app_settings it's a fixed
-// span (startedAt + duration); otherwise it falls back to the legacy daily
-// cutoff (midnight in PeriodTimezone). Changing the setting affects the
-// running period at the next sweep — that's the intended "global knob".
+// isPastCutoff reports whether the period should be closed. If a period
+// duration is configured in app_settings it's a fixed span (startedAt +
+// duration); otherwise it falls back to the legacy daily (midnight) cutoff.
 func (s *Service) isPastCutoff(ctx context.Context, startedAt, now time.Time) bool {
 	if dur, ok := appsettings.PeriodDuration(ctx, s.db); ok {
 		return !now.Before(startedAt.Add(dur))
@@ -97,107 +103,142 @@ func (s *Service) isPastCutoff(ctx context.Context, startedAt, now time.Time) bo
 	return isPastDailyCutoff(startedAt, now)
 }
 
+// nextPeriodCutoff returns the timestamp when the current cycle ends. Same
+// logic as isPastCutoff but forward-looking — used to power the completed-
+// period countdown card in the UI.
+func (s *Service) nextPeriodCutoff(ctx context.Context, startedAt, now time.Time) time.Time {
+	if dur, ok := appsettings.PeriodDuration(ctx, s.db); ok {
+		return startedAt.Add(dur)
+	}
+	return nextDailyCutoff(now)
+}
+
+// CurrentPeriod bundles everything the handler needs to build a period
+// response: the period record, its full tile set (all final_grid_size² tiles,
+// including future-locked ones), and the count of drawn tiles in the
+// currently-playable window.
 type CurrentPeriod struct {
-	Period     *Period
-	GridConfig *GridConfig
-	Tiles      []Tile
-	DrawnCount int64
+	Period       *Period
+	Tiles        []Tile
+	DrawnCount   int64
+	TotalCount   int64
+	PhaseSizes   []int
+	OuterDisplay string
+	// NextPeriodStartsAt is populated only when Period.Status is completed —
+	// the frontend's countdown target.
+	NextPeriodStartsAt *time.Time
 }
 
-// GetActivePeriod returns the active period domain object for a given game.
-func (s *Service) GetActivePeriod(ctx context.Context, gameType GameType) (*Period, error) {
-	return s.repo.GetActivePeriod(ctx, gameType)
+// PhaseWindowSize returns the side length of the unlocked window at the given
+// 1-indexed phase. Falls back to phaseSizes[len-1] if phase overshoots.
+func PhaseWindowSize(phase int, phaseSizes []int) int {
+	if len(phaseSizes) == 0 {
+		return 0
+	}
+	if phase < 1 {
+		return phaseSizes[0]
+	}
+	if phase-1 >= len(phaseSizes) {
+		return phaseSizes[len(phaseSizes)-1]
+	}
+	return phaseSizes[phase-1]
 }
 
-// GetPeriodByTileID returns the period that owns a given tile. Used by code
-// paths (like submission) that operate on a single tile and need to derive
-// which game they're acting on.
+// GetActivePeriod returns the sole active period or ErrPeriodNotFound.
+func (s *Service) GetActivePeriod(ctx context.Context) (*Period, error) {
+	return s.repo.GetActivePeriod(ctx)
+}
+
+// GetPeriodByTileID returns the period that owns a given tile.
 func (s *Service) GetPeriodByTileID(ctx context.Context, tileID uuid.UUID) (*Period, error) {
 	return s.repo.GetPeriodByTileID(ctx, tileID)
 }
 
-// GetCurrent returns the active period for the given game with its grid
-// config and tiles.
-func (s *Service) GetCurrent(ctx context.Context, gameType GameType) (*CurrentPeriod, error) {
-	period, err := s.repo.GetActivePeriod(ctx, gameType)
+// GetCurrent returns the active period with its tiles + counts + config
+// snapshot. Falls back to the most-recent completed period when no active
+// one exists, so the frontend can render the "come back tomorrow" resting
+// state (see docs/game-model-rework.md §M4). Only returns ErrPeriodNotFound
+// when the DB has literally never held a period.
+func (s *Service) GetCurrent(ctx context.Context) (*CurrentPeriod, error) {
+	period, err := s.repo.GetActivePeriod(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("grid service: get current: %w", err)
+		if !errors.Is(err, ErrPeriodNotFound) {
+			return nil, fmt.Errorf("grid service: get current: %w", err)
+		}
+		period, err = s.repo.GetLatestCompletedPeriod(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("grid service: get latest completed: %w", err)
+		}
 	}
-
-	gridCfg, err := s.repo.GetGridConfig(ctx, period.Phase)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: get grid config for phase %d: %w", period.Phase, err)
-	}
-
-	tiles, err := s.repo.GetTilesByPeriodAndPhase(ctx, period.ID, period.Phase)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: get tiles: %w", err)
-	}
-
-	drawnCount, _, err := s.repo.CountTilesByStatus(ctx, period.ID, period.Phase)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: count tiles: %w", err)
-	}
-
-	return &CurrentPeriod{
-		Period:     period,
-		GridConfig: gridCfg,
-		Tiles:      tiles,
-		DrawnCount: drawnCount,
-	}, nil
+	return s.hydratePeriod(ctx, period)
 }
 
-// GetByID returns a period by its ID with grid config and tiles.
+// GetByID returns a period by its ID hydrated the same way as GetCurrent.
 func (s *Service) GetByID(ctx context.Context, id uuid.UUID) (*CurrentPeriod, error) {
 	period, err := s.repo.GetPeriodByID(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: get by id: %w", err)
 	}
+	return s.hydratePeriod(ctx, period)
+}
 
-	gridCfg, err := s.repo.GetGridConfig(ctx, period.Phase)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: get grid config: %w", err)
-	}
-
-	tiles, err := s.repo.GetTilesByPeriodAndPhase(ctx, period.ID, period.Phase)
+func (s *Service) hydratePeriod(ctx context.Context, period *Period) (*CurrentPeriod, error) {
+	tiles, err := s.repo.GetTilesByPeriod(ctx, period.ID)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: get tiles: %w", err)
 	}
-
-	drawnCount, _, err := s.repo.CountTilesByStatus(ctx, period.ID, period.Phase)
+	drawn, total, err := s.repo.CountTilesUpToPhase(ctx, period.ID, period.Phase)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: count tiles: %w", err)
 	}
-
-	return &CurrentPeriod{
-		Period:     period,
-		GridConfig: gridCfg,
-		Tiles:      tiles,
-		DrawnCount: drawnCount,
-	}, nil
+	cp := &CurrentPeriod{
+		Period:       period,
+		Tiles:        tiles,
+		DrawnCount:   drawn,
+		TotalCount:   total,
+		PhaseSizes:   appsettings.PhaseGridSizes(ctx, s.db),
+		OuterDisplay: appsettings.OuterTileDisplay(ctx, s.db),
+	}
+	if period.Status == PeriodCompleted {
+		t := s.nextPeriodCutoff(ctx, period.StartedAt, time.Now())
+		cp.NextPeriodStartsAt = &t
+	}
+	return cp, nil
 }
 
-// ListArchive returns completed periods with pagination, scoped to a single
-// game so photo and prompt archives stay independent.
-func (s *Service) ListArchive(ctx context.Context, gameType GameType, limit, offset int) ([]Period, error) {
-	periods, err := s.repo.ListCompletedPeriods(ctx, gameType, limit, offset)
+// ListArchive returns completed periods with pagination.
+func (s *Service) ListArchive(ctx context.Context, limit, offset int) ([]Period, error) {
+	periods, err := s.repo.ListCompletedPeriods(ctx, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: list archive: %w", err)
 	}
 	return periods, nil
 }
 
-// ComposeFinalImage downloads all tile submissions for the given phase,
-// stitches them into a JPEG mosaic, uploads it, and saves the storage key on
-// the period. Idempotent: re-running overwrites the previous mosaic, so the
-// archive always shows the highest-fidelity phase that has been completed.
+// ComposeFinalImage stitches every drawn tile with phase <= `phase` into a
+// mosaic and stores it under the period's archive key. The canvas is sized to
+// the phase's window (from phase_grid_sizes) so early-phase mosaics show only
+// the drawn center; the final-phase mosaic covers the entire final grid.
+//
+// Idempotent: re-running overwrites the previous mosaic, so the archive
+// always shows the highest-fidelity phase composed so far.
 func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, phase int) error {
-	gridCfg, err := s.repo.GetGridConfig(ctx, phase)
+	period, err := s.repo.GetPeriodByID(ctx, periodID)
 	if err != nil {
-		return fmt.Errorf("compose: get grid config for phase %d: %w", phase, err)
+		return fmt.Errorf("compose: get period: %w", err)
 	}
 
-	tiles, err := s.repo.GetTilesByPeriodAndPhase(ctx, periodID, phase)
+	phaseSizes := appsettings.PhaseGridSizes(ctx, s.db)
+	windowSize := PhaseWindowSize(phase, phaseSizes)
+	if windowSize <= 0 {
+		return fmt.Errorf("compose: no window size for phase %d", phase)
+	}
+	// Window is centered on the final grid. For a final_grid_size=9 with
+	// phase 2 (windowSize=5), tiles at absolute rows 2..6 are translated to
+	// composer rows 0..4.
+	offset := (period.FinalGridSize - windowSize) / 2
+
+	allTiles, err := s.repo.GetTilesByPeriod(ctx, periodID)
 	if err != nil {
 		return fmt.Errorf("compose: get tiles: %w", err)
 	}
@@ -207,16 +248,17 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 		row, col int
 		data     []byte
 	}
-	results := make([]fetched, len(tiles))
+	results := make([]fetched, 0, len(allTiles))
+	var resultsMu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(composeFetchConcurrency)
 	var failedMu sync.Mutex
 	failedKeys := make([]string, 0)
-	for i, t := range tiles {
-		if t.SubmissionKey == "" {
+	for _, t := range allTiles {
+		if t.Phase > phase || t.SubmissionKey == "" {
 			continue
 		}
-		i, t := i, t
+		t := t
 		g.Go(func() error {
 			data, err := s.store.GetObject(gctx, t.SubmissionKey)
 			if err != nil {
@@ -225,7 +267,9 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 				failedMu.Unlock()
 				return nil // missing tile is non-fatal — leaves a black cell
 			}
-			results[i] = fetched{row: t.RowIndex, col: t.ColIndex, data: data}
+			resultsMu.Lock()
+			results = append(results, fetched{row: t.RowIndex - offset, col: t.ColIndex - offset, data: data})
+			resultsMu.Unlock()
 			return nil
 		})
 	}
@@ -238,9 +282,6 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 
 	tileImgs := make([]composer.TileImage, 0, len(results))
 	for _, r := range results {
-		if r.data == nil {
-			continue
-		}
 		tileImgs = append(tileImgs, composer.TileImage{
 			Row:  r.row,
 			Col:  r.col,
@@ -249,17 +290,11 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 	}
 
 	if len(tileImgs) == 0 {
-		return fmt.Errorf("compose: no tile images for period %s", periodID)
+		return fmt.Errorf("compose: no tile images for period %s at phase %d", periodID, phase)
 	}
 
-	// Clamp cell size so a high-phase grid doesn't blow up the canvas. At
-	// phase 20 (231x231) this gives ~9px per cell — individual cells lose
-	// detail but the mosaic stays a sane file size.
-	maxDim := gridCfg.Columns
-	if gridCfg.Rows > maxDim {
-		maxDim = gridCfg.Rows
-	}
-	cellSize := maxFullSize / maxDim
+	// Clamp cell size so a large window doesn't blow up the canvas.
+	cellSize := maxFullSize / windowSize
 	if cellSize < 1 {
 		cellSize = 1
 	}
@@ -268,8 +303,8 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 	}
 
 	mosaic, err := composer.Compose(composer.Options{
-		Cols:     gridCfg.Columns,
-		Rows:     gridCfg.Rows,
+		Cols:     windowSize,
+		Rows:     windowSize,
 		CellSize: cellSize,
 	}, tileImgs)
 	if err != nil {
@@ -286,7 +321,6 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 	// Cheap thumbnail derived from the full so the calendar list stays light.
 	thumb, err := composer.Thumbnail(mosaic, thumbSize)
 	if err != nil {
-		// Thumb failure is non-fatal — we can fall back to the full URL.
 		s.log.Warn().Err(err).Str("period_id", periodID.String()).Msg("compose: thumbnail")
 	} else {
 		if err := s.store.PutObject(ctx, ThumbnailKey(fullKey), thumb, "image/jpeg"); err != nil {
@@ -305,6 +339,7 @@ func (s *Service) ComposeFinalImage(ctx context.Context, periodID uuid.UUID, pha
 	s.log.Info().
 		Str("period_id", periodID.String()).
 		Int("phase", phase).
+		Int("window_size", windowSize).
 		Str("key", fullKey).
 		Int("cell_size", cellSize).
 		Int("tiles", len(tileImgs)).
@@ -320,21 +355,11 @@ func (s *Service) ListMosaics(ctx context.Context, periodID uuid.UUID) ([]PhaseM
 	return s.repo.ListMosaicsByPeriod(ctx, periodID)
 }
 
-// SweepExpiredPeriod closes any active periods past their daily cutoff
-// (midnight in PeriodTimezone) for both games, composes a final mosaic for
-// whatever phase was in flight, then auto-rotates each game from its own
-// schedule. Each step's failure is logged but doesn't block the others.
+// SweepExpiredPeriod closes any active period past its cutoff, composes a
+// final mosaic for whatever phase was in flight, then auto-rotates to the
+// next scheduled image. Errors are logged but don't cascade.
 func (s *Service) SweepExpiredPeriod(ctx context.Context) error {
-	for _, gt := range []GameType{GamePhoto, GamePrompt} {
-		if err := s.sweepGame(ctx, gt); err != nil {
-			s.log.Warn().Err(err).Str("game_type", string(gt)).Msg("sweep game")
-		}
-	}
-	return nil
-}
-
-func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
-	p, err := s.repo.GetActivePeriod(ctx, gameType)
+	p, err := s.repo.GetActivePeriod(ctx)
 	if err == nil {
 		if !s.isPastCutoff(ctx, p.StartedAt, time.Now()) {
 			return nil
@@ -344,7 +369,7 @@ func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
 			return fmt.Errorf("sweep period: complete: %w", cErr)
 		}
 
-		drawn, total, cntErr := s.repo.CountTilesByStatus(ctx, p.ID, p.Phase)
+		drawn, total, cntErr := s.repo.CountTilesUpToPhase(ctx, p.ID, p.Phase)
 		if cntErr != nil {
 			s.log.Warn().Err(cntErr).Msg("sweep period: count tiles")
 		} else if drawn > 0 {
@@ -355,7 +380,6 @@ func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
 
 		s.log.Info().
 			Str("period_id", p.ID.String()).
-			Str("game_type", string(gameType)).
 			Int64("drawn", drawn).
 			Int64("total", total).
 			Int("phase", p.Phase).
@@ -364,9 +388,9 @@ func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
 		return fmt.Errorf("sweep period: get active: %w", err)
 	}
 
-	// Try to spawn a new period for today using the per-game schedule.
-	if err := s.rotateForToday(ctx, gameType); err != nil {
-		s.log.Warn().Err(err).Str("game_type", string(gameType)).Msg("sweep period: auto-rotate skipped")
+	// Try to spawn a new period for today from the schedule.
+	if err := s.rotateForToday(ctx); err != nil {
+		s.log.Warn().Err(err).Msg("sweep period: auto-rotate skipped")
 	}
 	return nil
 }
@@ -375,14 +399,13 @@ func (s *Service) sweepGame(ctx context.Context, gameType GameType) error {
 // outside the package (e.g. the debug handler reacting to a schedule upsert)
 // can trigger an immediate rotation when an admin uploads today's content
 // instead of waiting for the midnight sweeper.
-func (s *Service) RotateForToday(ctx context.Context, gameType GameType) error {
-	return s.rotateForToday(ctx, gameType)
+func (s *Service) RotateForToday(ctx context.Context) error {
+	return s.rotateForToday(ctx)
 }
 
-// rotateForToday promotes today's schedule entry for the given game and
-// creates an active period from it. No-op if a period for today already exists
-// or nothing is scheduled.
-func (s *Service) rotateForToday(ctx context.Context, gameType GameType) error {
+// rotateForToday promotes today's scheduled image into an active period.
+// No-op if a period for today already exists or nothing is scheduled.
+func (s *Service) rotateForToday(ctx context.Context) error {
 	loc, err := time.LoadLocation(PeriodTimezone)
 	if err != nil {
 		return fmt.Errorf("load tz: %w", err)
@@ -391,7 +414,7 @@ func (s *Service) rotateForToday(ctx context.Context, gameType GameType) error {
 	y, m, d := now.Date()
 	today := time.Date(y, m, d, 0, 0, 0, 0, loc)
 
-	if existing, err := s.repo.GetActivePeriod(ctx, gameType); err == nil {
+	if existing, err := s.repo.GetActivePeriod(ctx); err == nil {
 		startedLocal := existing.StartedAt.In(loc)
 		ey, em, ed := startedLocal.Date()
 		if ey == y && em == m && ed == d {
@@ -399,17 +422,6 @@ func (s *Service) rotateForToday(ctx context.Context, gameType GameType) error {
 		}
 	}
 
-	switch gameType {
-	case GamePhoto:
-		return s.rotatePhotoForToday(ctx, today)
-	case GamePrompt:
-		return s.rotatePromptForToday(ctx, today)
-	default:
-		return fmt.Errorf("rotate: unknown game type %q", gameType)
-	}
-}
-
-func (s *Service) rotatePhotoForToday(ctx context.Context, today time.Time) error {
 	scheduled, err := s.imgRepo.GetScheduledByDate(ctx, today)
 	if err != nil {
 		if errors.Is(err, dailyimage.ErrNotFound) {
@@ -435,27 +447,6 @@ func (s *Service) rotatePhotoForToday(ctx context.Context, today time.Time) erro
 	return nil
 }
 
-func (s *Service) rotatePromptForToday(ctx context.Context, today time.Time) error {
-	scheduled, err := s.imgRepo.GetScheduledPromptByDate(ctx, today)
-	if err != nil {
-		if errors.Is(err, dailyimage.ErrNotFound) {
-			return fmt.Errorf("no scheduled prompt for %s", today.Format("2006-01-02"))
-		}
-		return fmt.Errorf("get scheduled prompt: %w", err)
-	}
-
-	period, err := s.CreatePromptPeriod(ctx, scheduled.Prompt)
-	if err != nil {
-		return fmt.Errorf("create period: %w", err)
-	}
-
-	s.log.Info().
-		Str("period_id", period.ID.String()).
-		Str("date", today.Format("2006-01-02")).
-		Msg("auto-rotated to scheduled prompt")
-	return nil
-}
-
 // RecomposeMissing iterates all completed periods missing a final image and
 // composes each one using its final phase. Returns the count successfully composed.
 func (s *Service) RecomposeMissing(ctx context.Context) (int, error) {
@@ -474,44 +465,37 @@ func (s *Service) RecomposeMissing(ctx context.Context) (int, error) {
 	return composed, nil
 }
 
-// CreatePhotoPeriod creates a new active photo-game period anchored to a
-// daily image and generates all tiles for phase 1.
+// CreatePhotoPeriod creates a new active period anchored to a daily image and
+// seeds all final_grid_size² tiles up front. The center 3×3 (or whatever
+// phase_grid_sizes[0] resolves to) starts phase_locked=FALSE; outer rings
+// start locked and get flipped ring-by-ring as phases advance.
 func (s *Service) CreatePhotoPeriod(ctx context.Context, dailyImageID uuid.UUID) (*Period, error) {
-	period, err := s.repo.CreatePeriod(ctx, &dailyImageID, GamePhoto, PeriodActive, 1, "")
+	phaseSizes := appsettings.PhaseGridSizes(ctx, s.db)
+	finalSize := phaseSizes[len(phaseSizes)-1]
+
+	period, err := s.repo.CreatePeriod(ctx, dailyImageID, PeriodActive, 1, finalSize)
 	if err != nil {
 		return nil, fmt.Errorf("grid service: create photo period: %w", err)
 	}
-	if err := s.populatePhase1Tiles(ctx, period); err != nil {
+	if err := s.seedAllTiles(ctx, period, phaseSizes); err != nil {
 		return nil, err
 	}
 	return period, nil
 }
 
-// CreatePromptPeriod creates a new active prompt-game period anchored to a
-// text prompt and generates all tiles for phase 1.
-func (s *Service) CreatePromptPeriod(ctx context.Context, prompt string) (*Period, error) {
-	if prompt == "" {
-		return nil, fmt.Errorf("grid service: prompt period requires non-empty prompt")
-	}
-	period, err := s.repo.CreatePeriod(ctx, nil, GamePrompt, PeriodActive, 1, prompt)
-	if err != nil {
-		return nil, fmt.Errorf("grid service: create prompt period: %w", err)
-	}
-	if err := s.populatePhase1Tiles(ctx, period); err != nil {
-		return nil, err
-	}
-	return period, nil
-}
+// seedAllTiles inserts finalSize² tile rows for the given period. Each tile's
+// phase is the smallest phase whose concentric window covers it. Tiles at
+// phase 1 start playable (phase_locked=false); everything else is
+// phase_locked=true and gets unlocked when its ring is reached.
+func (s *Service) seedAllTiles(ctx context.Context, period *Period, phaseSizes []int) error {
+	finalSize := period.FinalGridSize
+	center := finalSize / 2 // integer division; finalSize is odd
 
-func (s *Service) populatePhase1Tiles(ctx context.Context, period *Period) error {
-	gridCfg, err := s.repo.GetGridConfig(ctx, 1)
-	if err != nil {
-		return fmt.Errorf("grid service: get phase 1 config: %w", err)
-	}
-
-	for row := range gridCfg.Rows {
-		for col := range gridCfg.Columns {
-			if _, err := s.repo.CreateTile(ctx, period.ID, 1, row, col); err != nil {
+	for row := 0; row < finalSize; row++ {
+		for col := 0; col < finalSize; col++ {
+			phase := tilePhase(row, col, center, phaseSizes)
+			phaseLocked := phase > 1
+			if _, err := s.repo.CreateTile(ctx, period.ID, phase, row, col, phaseLocked); err != nil {
 				return fmt.Errorf("grid service: create tile [%d,%d]: %w", row, col, err)
 			}
 		}
@@ -519,11 +503,36 @@ func (s *Service) populatePhase1Tiles(ctx context.Context, period *Period) error
 
 	s.log.Info().
 		Str("period_id", period.ID.String()).
-		Str("game_type", period.GameType).
-		Int("rows", gridCfg.Rows).
-		Int("cols", gridCfg.Columns).
-		Msg("created period with tiles")
+		Int("final_grid_size", finalSize).
+		Int("total_tiles", finalSize*finalSize).
+		Msg("seeded period tiles")
 	return nil
+}
+
+// tilePhase returns the smallest phase index (1-based) whose concentric
+// window covers the given (row, col). Tiles are assigned to the first phase
+// that includes them so the phase field is stable for the tile's lifetime.
+func tilePhase(row, col, center int, phaseSizes []int) int {
+	dr := row - center
+	if dr < 0 {
+		dr = -dr
+	}
+	dc := col - center
+	if dc < 0 {
+		dc = -dc
+	}
+	dist := dr
+	if dc > dist {
+		dist = dc
+	}
+	for i, size := range phaseSizes {
+		if dist <= size/2 {
+			return i + 1
+		}
+	}
+	// Should never happen if the last phase covers the full grid, but fall
+	// back to the last phase index so the tile is at least assignable.
+	return len(phaseSizes)
 }
 
 // PhaseResult describes what happened after checking phase completion.
@@ -531,45 +540,36 @@ type PhaseResult int
 
 const (
 	PhaseIncomplete  PhaseResult = iota // Not all tiles drawn yet.
-	PhaseAdvanced                       // Advanced to next phase with new tiles.
-	PhaseAllComplete                    // All phases done, period closed.
+	PhaseAdvanced                       // Next ring unlocked; period continues.
+	PhaseAllComplete                    // All rings drawn; masterpiece complete.
 )
 
-// CheckPhaseCompletion checks if all tiles are drawn and advances to the next phase or completes the period.
+// CheckPhaseCompletion looks at the currently-playable window; if every tile
+// in it is drawn it advances to the next ring (or, if this was the last ring,
+// completes the period and composes the masterpiece).
 func (s *Service) CheckPhaseCompletion(ctx context.Context, periodID uuid.UUID) (PhaseResult, error) {
 	period, err := s.repo.GetPeriodByID(ctx, periodID)
 	if err != nil {
 		return PhaseIncomplete, fmt.Errorf("grid service: check completion: %w", err)
 	}
 
-	drawnCount, totalCount, err := s.repo.CountTilesByStatus(ctx, period.ID, period.Phase)
+	drawnCount, totalCount, err := s.repo.CountTilesUpToPhase(ctx, period.ID, period.Phase)
 	if err != nil {
 		return PhaseIncomplete, fmt.Errorf("grid service: count tiles: %w", err)
 	}
-
 	if drawnCount < totalCount {
 		return PhaseIncomplete, nil
 	}
 
+	phaseSizes := appsettings.PhaseGridSizes(ctx, s.db)
 	completedPhase := period.Phase
+	isLastPhase := completedPhase >= len(phaseSizes)
 
-	// Configured duration elapsed (or legacy midnight) or phase-cap reached
-	// → close the period.
-	timeUp := s.isPastCutoff(ctx, period.StartedAt, time.Now())
-	phasesUp := completedPhase >= MaxPhasesPerPeriod
-
-	nextPhase := completedPhase + 1
-	nextCfg, err := s.repo.GetGridConfig(ctx, nextPhase)
-	noNextConfig := err != nil
-
-	if timeUp || phasesUp || noNextConfig {
+	if isLastPhase {
 		s.log.Info().
 			Str("period_id", periodID.String()).
 			Int("completed_phase", completedPhase).
-			Bool("time_up", timeUp).
-			Bool("phases_up", phasesUp).
-			Bool("no_next_config", noNextConfig).
-			Msg("closing period")
+			Msg("masterpiece complete — closing period")
 		if err := s.repo.CompletePeriod(ctx, periodID); err != nil {
 			return PhaseIncomplete, err
 		}
@@ -579,27 +579,21 @@ func (s *Service) CheckPhaseCompletion(ctx context.Context, periodID uuid.UUID) 
 		return PhaseAllComplete, nil
 	}
 
+	nextPhase := completedPhase + 1
 	if err := s.repo.UpdatePeriodPhase(ctx, periodID, nextPhase); err != nil {
 		return PhaseIncomplete, fmt.Errorf("grid service: update phase: %w", err)
 	}
-
-	for row := range nextCfg.Rows {
-		for col := range nextCfg.Columns {
-			if _, err := s.repo.CreateTile(ctx, periodID, nextPhase, row, col); err != nil {
-				return PhaseIncomplete, fmt.Errorf("grid service: create tile [%d,%d]: %w", row, col, err)
-			}
-		}
+	if err := s.repo.UnlockPhaseRing(ctx, periodID, nextPhase); err != nil {
+		return PhaseIncomplete, fmt.Errorf("grid service: unlock ring: %w", err)
 	}
 
 	s.log.Info().
 		Str("period_id", periodID.String()).
 		Int("phase", nextPhase).
-		Int("rows", nextCfg.Rows).
-		Int("cols", nextCfg.Columns).
+		Int("window_size", PhaseWindowSize(nextPhase, phaseSizes)).
 		Msg("advanced to next phase")
 
-	// Compose mosaic for the phase we just finished — replaces any previous
-	// mosaic for this period so the archive always shows the latest fidelity.
+	// Compose interim mosaic for the ring we just finished.
 	if composeErr := s.ComposeFinalImage(ctx, periodID, completedPhase); composeErr != nil {
 		s.log.Error().Err(composeErr).Str("period_id", periodID.String()).Int("phase", completedPhase).Msg("compose mosaic")
 	}

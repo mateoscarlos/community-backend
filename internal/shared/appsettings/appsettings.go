@@ -7,7 +7,9 @@ package appsettings
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -90,4 +92,110 @@ func SetTileRetentionDays(ctx context.Context, db *sql.DB, days int) error {
 		days = 1
 	}
 	return Set(ctx, db, KeyTileRetentionDays, strconv.Itoa(days))
+}
+
+// KeyPhaseGridSizes is a JSON int array describing the concentric-ring
+// progression of the game grid: entry i is the side length of the unlocked
+// window at phase (i+1). Values must be odd, strictly increasing, and the
+// first must be >= 3 (see docs/game-model-rework.md).
+const KeyPhaseGridSizes = "phase_grid_sizes"
+
+// KeyOuterTileDisplay controls how the frontend renders tiles whose phase
+// > period.phase. "blocked" shows them dark and inert; "hidden" omits them
+// entirely so the viewport is exactly the currently-unlocked window.
+const KeyOuterTileDisplay = "outer_tile_display"
+
+// OuterTileDisplayBlocked / OuterTileDisplayHidden are the only two valid
+// values for KeyOuterTileDisplay. Anything else falls back to Blocked.
+const (
+	OuterTileDisplayBlocked = "blocked"
+	OuterTileDisplayHidden  = "hidden"
+)
+
+// DefaultPhaseGridSizes is the fallback progression (3×3 → 5×5 → 7×7 → 9×9).
+// Returning a copy from PhaseGridSizes; callers may mutate freely.
+var DefaultPhaseGridSizes = []int{3, 5, 7, 9}
+
+// PhaseGridSizes returns the configured ring progression, falling back to
+// DefaultPhaseGridSizes when unset or invalid. Always returns a validated
+// slice — callers do not need to re-check invariants.
+func PhaseGridSizes(ctx context.Context, db *sql.DB) []int {
+	raw, found, err := Get(ctx, db, KeyPhaseGridSizes)
+	if err != nil || !found {
+		return append([]int(nil), DefaultPhaseGridSizes...)
+	}
+	sizes, err := parsePhaseGridSizes(raw)
+	if err != nil {
+		return append([]int(nil), DefaultPhaseGridSizes...)
+	}
+	return sizes
+}
+
+// SetPhaseGridSizes validates and stores the ring progression. Returns an
+// error if the array violates the invariants (see KeyPhaseGridSizes).
+func SetPhaseGridSizes(ctx context.Context, db *sql.DB, sizes []int) error {
+	if err := validatePhaseGridSizes(sizes); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(sizes)
+	if err != nil {
+		return fmt.Errorf("appsettings: marshal phase_grid_sizes: %w", err)
+	}
+	return Set(ctx, db, KeyPhaseGridSizes, string(encoded))
+}
+
+// OuterTileDisplay returns the configured outer-tile render mode, falling
+// back to OuterTileDisplayBlocked when unset or invalid.
+func OuterTileDisplay(ctx context.Context, db *sql.DB) string {
+	raw, found, err := Get(ctx, db, KeyOuterTileDisplay)
+	if err != nil || !found {
+		return OuterTileDisplayBlocked
+	}
+	if raw != OuterTileDisplayBlocked && raw != OuterTileDisplayHidden {
+		return OuterTileDisplayBlocked
+	}
+	return raw
+}
+
+// SetOuterTileDisplay validates and stores the render mode.
+func SetOuterTileDisplay(ctx context.Context, db *sql.DB, mode string) error {
+	if mode != OuterTileDisplayBlocked && mode != OuterTileDisplayHidden {
+		return fmt.Errorf("appsettings: outer_tile_display must be %q or %q, got %q",
+			OuterTileDisplayBlocked, OuterTileDisplayHidden, mode)
+	}
+	return Set(ctx, db, KeyOuterTileDisplay, mode)
+}
+
+func parsePhaseGridSizes(raw string) ([]int, error) {
+	var sizes []int
+	if err := json.Unmarshal([]byte(raw), &sizes); err != nil {
+		return nil, fmt.Errorf("appsettings: parse phase_grid_sizes: %w", err)
+	}
+	if err := validatePhaseGridSizes(sizes); err != nil {
+		return nil, err
+	}
+	return sizes, nil
+}
+
+// validatePhaseGridSizes enforces the ring-progression invariants documented
+// on KeyPhaseGridSizes. Called by both the reader (to guard against manual
+// SQL edits) and the setter (to guard against the admin UI).
+func validatePhaseGridSizes(sizes []int) error {
+	if len(sizes) == 0 {
+		return errors.New("appsettings: phase_grid_sizes must have at least one entry")
+	}
+	prev := 0
+	for i, s := range sizes {
+		if s < 3 {
+			return fmt.Errorf("appsettings: phase_grid_sizes[%d]=%d must be >= 3", i, s)
+		}
+		if s%2 == 0 {
+			return fmt.Errorf("appsettings: phase_grid_sizes[%d]=%d must be odd", i, s)
+		}
+		if s <= prev {
+			return fmt.Errorf("appsettings: phase_grid_sizes must be strictly increasing (index %d: %d <= %d)", i, s, prev)
+		}
+		prev = s
+	}
+	return nil
 }

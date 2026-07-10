@@ -22,52 +22,58 @@ func (q *Queries) CompletePeriod(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const countTilesByStatus = `-- name: CountTilesByStatus :one
+const countTilesUpToPhase = `-- name: CountTilesUpToPhase :one
 SELECT
     count(*) FILTER (WHERE status = 'drawn') AS drawn_count,
     count(*) AS total_count
 FROM tiles
-WHERE period_id = $1 AND phase = $2
+WHERE period_id = $1 AND phase <= $2 AND phase_locked = FALSE
 `
 
-type CountTilesByStatusParams struct {
+type CountTilesUpToPhaseParams struct {
 	PeriodID uuid.UUID `json:"period_id"`
 	Phase    int32     `json:"phase"`
 }
 
-type CountTilesByStatusRow struct {
+type CountTilesUpToPhaseRow struct {
 	DrawnCount int64 `json:"drawn_count"`
 	TotalCount int64 `json:"total_count"`
 }
 
-func (q *Queries) CountTilesByStatus(ctx context.Context, arg CountTilesByStatusParams) (CountTilesByStatusRow, error) {
-	row := q.db.QueryRowContext(ctx, countTilesByStatus, arg.PeriodID, arg.Phase)
-	var i CountTilesByStatusRow
+// Counts drawn vs total for the currently-playable window (phase <= max_phase
+// AND phase_locked = FALSE). Used by phase-completion checks: when
+// drawn_count = total_count, the current ring is done.
+func (q *Queries) CountTilesUpToPhase(ctx context.Context, arg CountTilesUpToPhaseParams) (CountTilesUpToPhaseRow, error) {
+	row := q.db.QueryRowContext(ctx, countTilesUpToPhase, arg.PeriodID, arg.Phase)
+	var i CountTilesUpToPhaseRow
 	err := row.Scan(&i.DrawnCount, &i.TotalCount)
 	return i, err
 }
 
 const createPeriod = `-- name: CreatePeriod :one
-INSERT INTO periods (daily_image_id, game_type, status, phase, prompt)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, daily_image_id, game_type, status, phase, started_at, ended_at, created_at, updated_at, final_image_key, composed_at, prompt
+INSERT INTO periods (daily_image_id, status, phase, final_grid_size)
+VALUES ($1, $2, $3, $4)
+RETURNING id, daily_image_id, game_type, status, phase, final_grid_size,
+          started_at, ended_at, created_at, updated_at,
+          final_image_key, composed_at
 `
 
 type CreatePeriodParams struct {
-	DailyImageID uuid.NullUUID  `json:"daily_image_id"`
-	GameType     string         `json:"game_type"`
-	Status       string         `json:"status"`
-	Phase        int32          `json:"phase"`
-	Prompt       sql.NullString `json:"prompt"`
+	DailyImageID  uuid.NullUUID `json:"daily_image_id"`
+	Status        string        `json:"status"`
+	Phase         int32         `json:"phase"`
+	FinalGridSize int32         `json:"final_grid_size"`
 }
 
+// game_type is pinned to 'photo' at the DB level (see migrations/00022) —
+// the column is retained for archive compatibility but no longer written from
+// the app.
 func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Period, error) {
 	row := q.db.QueryRowContext(ctx, createPeriod,
 		arg.DailyImageID,
-		arg.GameType,
 		arg.Status,
 		arg.Phase,
-		arg.Prompt,
+		arg.FinalGridSize,
 	)
 	var i Period
 	err := row.Scan(
@@ -76,36 +82,40 @@ func (q *Queries) CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Per
 		&i.GameType,
 		&i.Status,
 		&i.Phase,
+		&i.FinalGridSize,
 		&i.StartedAt,
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
-		&i.Prompt,
 	)
 	return i, err
 }
 
 const createTile = `-- name: CreateTile :one
-INSERT INTO tiles (period_id, phase, row_index, col_index, status)
-VALUES ($1, $2, $3, $4, 'free')
-RETURNING id, period_id, phase, row_index, col_index, status, created_at, updated_at
+INSERT INTO tiles (period_id, phase, row_index, col_index, status, phase_locked)
+VALUES ($1, $2, $3, $4, 'free', $5)
+RETURNING id, period_id, phase, row_index, col_index, status, phase_locked, created_at, updated_at
 `
 
 type CreateTileParams struct {
-	PeriodID uuid.UUID `json:"period_id"`
-	Phase    int32     `json:"phase"`
-	RowIndex int32     `json:"row_index"`
-	ColIndex int32     `json:"col_index"`
+	PeriodID    uuid.UUID `json:"period_id"`
+	Phase       int32     `json:"phase"`
+	RowIndex    int32     `json:"row_index"`
+	ColIndex    int32     `json:"col_index"`
+	PhaseLocked bool      `json:"phase_locked"`
 }
 
+// phase_locked defaults to FALSE; phase-1 tiles are always unlocked. The
+// caller passes TRUE for any tile whose ring hasn't unlocked yet.
 func (q *Queries) CreateTile(ctx context.Context, arg CreateTileParams) (Tile, error) {
 	row := q.db.QueryRowContext(ctx, createTile,
 		arg.PeriodID,
 		arg.Phase,
 		arg.RowIndex,
 		arg.ColIndex,
+		arg.PhaseLocked,
 	)
 	var i Tile
 	err := row.Scan(
@@ -115,6 +125,7 @@ func (q *Queries) CreateTile(ctx context.Context, arg CreateTileParams) (Tile, e
 		&i.RowIndex,
 		&i.ColIndex,
 		&i.Status,
+		&i.PhaseLocked,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -122,16 +133,18 @@ func (q *Queries) CreateTile(ctx context.Context, arg CreateTileParams) (Tile, e
 }
 
 const getActivePeriod = `-- name: GetActivePeriod :one
-SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
-       p.started_at, p.ended_at, p.created_at, p.updated_at,
-       p.final_image_key, p.composed_at, p.prompt
-FROM periods p
-WHERE p.status = 'active' AND p.game_type = $1
+SELECT id, daily_image_id, game_type, status, phase, final_grid_size,
+       started_at, ended_at, created_at, updated_at,
+       final_image_key, composed_at
+FROM periods
+WHERE status = 'active'
 LIMIT 1
 `
 
-func (q *Queries) GetActivePeriod(ctx context.Context, gameType string) (Period, error) {
-	row := q.db.QueryRowContext(ctx, getActivePeriod, gameType)
+// One active period at a time (see migrations/00022_drop_prompt_mode.sql —
+// the unique index enforces this).
+func (q *Queries) GetActivePeriod(ctx context.Context) (Period, error) {
+	row := q.db.QueryRowContext(ctx, getActivePeriod)
 	var i Period
 	err := row.Scan(
 		&i.ID,
@@ -139,40 +152,55 @@ func (q *Queries) GetActivePeriod(ctx context.Context, gameType string) (Period,
 		&i.GameType,
 		&i.Status,
 		&i.Phase,
+		&i.FinalGridSize,
 		&i.StartedAt,
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
-		&i.Prompt,
 	)
 	return i, err
 }
 
-const getGridConfig = `-- name: GetGridConfig :one
-SELECT id, phase, columns, rows, created_at
-FROM grid_configs
-WHERE phase = $1
+const getLatestCompletedPeriod = `-- name: GetLatestCompletedPeriod :one
+SELECT id, daily_image_id, game_type, status, phase, final_grid_size,
+       started_at, ended_at, created_at, updated_at,
+       final_image_key, composed_at
+FROM periods
+WHERE status = 'completed'
+ORDER BY ended_at DESC NULLS LAST, started_at DESC
+LIMIT 1
 `
 
-func (q *Queries) GetGridConfig(ctx context.Context, phase int32) (GridConfig, error) {
-	row := q.db.QueryRowContext(ctx, getGridConfig, phase)
-	var i GridConfig
+// The most recently ended period. Used by the resting "come back tomorrow"
+// view when no active period exists (masterpiece just finished, next
+// rotation not yet triggered). Newest first so the frontend shows the last
+// masterpiece, not an older archived one.
+func (q *Queries) GetLatestCompletedPeriod(ctx context.Context) (Period, error) {
+	row := q.db.QueryRowContext(ctx, getLatestCompletedPeriod)
+	var i Period
 	err := row.Scan(
 		&i.ID,
+		&i.DailyImageID,
+		&i.GameType,
+		&i.Status,
 		&i.Phase,
-		&i.Columns,
-		&i.Rows,
+		&i.FinalGridSize,
+		&i.StartedAt,
+		&i.EndedAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinalImageKey,
+		&i.ComposedAt,
 	)
 	return i, err
 }
 
 const getPeriodByID = `-- name: GetPeriodByID :one
-SELECT id, daily_image_id, game_type, status, phase,
+SELECT id, daily_image_id, game_type, status, phase, final_grid_size,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at, prompt
+       final_image_key, composed_at
 FROM periods
 WHERE id = $1
 `
@@ -186,21 +214,21 @@ func (q *Queries) GetPeriodByID(ctx context.Context, id uuid.UUID) (Period, erro
 		&i.GameType,
 		&i.Status,
 		&i.Phase,
+		&i.FinalGridSize,
 		&i.StartedAt,
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
-		&i.Prompt,
 	)
 	return i, err
 }
 
 const getPeriodByTileID = `-- name: GetPeriodByTileID :one
-SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase,
+SELECT p.id, p.daily_image_id, p.game_type, p.status, p.phase, p.final_grid_size,
        p.started_at, p.ended_at, p.created_at, p.updated_at,
-       p.final_image_key, p.composed_at, p.prompt
+       p.final_image_key, p.composed_at
 FROM periods p
 JOIN tiles t ON t.period_id = p.id
 WHERE t.id = $1
@@ -216,53 +244,54 @@ func (q *Queries) GetPeriodByTileID(ctx context.Context, id uuid.UUID) (Period, 
 		&i.GameType,
 		&i.Status,
 		&i.Phase,
+		&i.FinalGridSize,
 		&i.StartedAt,
 		&i.EndedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinalImageKey,
 		&i.ComposedAt,
-		&i.Prompt,
 	)
 	return i, err
 }
 
-const getTilesByPeriodAndPhase = `-- name: GetTilesByPeriodAndPhase :many
+const getTilesByPeriod = `-- name: GetTilesByPeriod :many
 SELECT t.id, t.period_id, t.phase, t.row_index, t.col_index, t.status,
+       t.phase_locked,
        COALESCE(s.storage_key, '') AS submission_key,
        t.created_at, t.updated_at
 FROM tiles t
 LEFT JOIN submissions s ON s.tile_id = t.id
-WHERE t.period_id = $1 AND t.phase = $2
+WHERE t.period_id = $1
 ORDER BY t.row_index, t.col_index
 `
 
-type GetTilesByPeriodAndPhaseParams struct {
-	PeriodID uuid.UUID `json:"period_id"`
-	Phase    int32     `json:"phase"`
-}
-
-type GetTilesByPeriodAndPhaseRow struct {
+type GetTilesByPeriodRow struct {
 	ID            uuid.UUID `json:"id"`
 	PeriodID      uuid.UUID `json:"period_id"`
 	Phase         int32     `json:"phase"`
 	RowIndex      int32     `json:"row_index"`
 	ColIndex      int32     `json:"col_index"`
 	Status        string    `json:"status"`
+	PhaseLocked   bool      `json:"phase_locked"`
 	SubmissionKey string    `json:"submission_key"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-func (q *Queries) GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPeriodAndPhaseParams) ([]GetTilesByPeriodAndPhaseRow, error) {
-	rows, err := q.db.QueryContext(ctx, getTilesByPeriodAndPhase, arg.PeriodID, arg.Phase)
+// All tiles for a period. In the concentric-ring model, tiles are seeded once
+// at period start for the full final_grid_size × final_grid_size grid; there
+// is no per-phase re-seeding. Callers use `phase` + `phase_locked` to decide
+// what to render.
+func (q *Queries) GetTilesByPeriod(ctx context.Context, periodID uuid.UUID) ([]GetTilesByPeriodRow, error) {
+	rows, err := q.db.QueryContext(ctx, getTilesByPeriod, periodID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []GetTilesByPeriodAndPhaseRow
+	var items []GetTilesByPeriodRow
 	for rows.Next() {
-		var i GetTilesByPeriodAndPhaseRow
+		var i GetTilesByPeriodRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.PeriodID,
@@ -270,6 +299,7 @@ func (q *Queries) GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPe
 			&i.RowIndex,
 			&i.ColIndex,
 			&i.Status,
+			&i.PhaseLocked,
 			&i.SubmissionKey,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -288,27 +318,24 @@ func (q *Queries) GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPe
 }
 
 const listCompletedPeriods = `-- name: ListCompletedPeriods :many
-SELECT id, daily_image_id, game_type, status, phase,
+SELECT id, daily_image_id, game_type, status, phase, final_grid_size,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at, prompt
+       final_image_key, composed_at
 FROM periods
 WHERE final_image_key IS NOT NULL
-  AND game_type = $1
 ORDER BY started_at DESC
-LIMIT $2 OFFSET $3
+LIMIT $1 OFFSET $2
 `
 
 type ListCompletedPeriodsParams struct {
-	GameType string `json:"game_type"`
-	Limit    int32  `json:"limit"`
-	Offset   int32  `json:"offset"`
+	Limit  int32 `json:"limit"`
+	Offset int32 `json:"offset"`
 }
 
-// Lists periods of a single game (photo or prompt) that have a composed
-// mosaic. Includes both completed and still-active periods, so today's
-// in-progress mosaic appears in the archive.
+// Lists periods that have a composed mosaic. Includes both completed and
+// still-active periods, so today's in-progress mosaic appears in the archive.
 func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPeriodsParams) ([]Period, error) {
-	rows, err := q.db.QueryContext(ctx, listCompletedPeriods, arg.GameType, arg.Limit, arg.Offset)
+	rows, err := q.db.QueryContext(ctx, listCompletedPeriods, arg.Limit, arg.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -322,13 +349,13 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 			&i.GameType,
 			&i.Status,
 			&i.Phase,
+			&i.FinalGridSize,
 			&i.StartedAt,
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.FinalImageKey,
 			&i.ComposedAt,
-			&i.Prompt,
 		); err != nil {
 			return nil, err
 		}
@@ -344,9 +371,9 @@ func (q *Queries) ListCompletedPeriods(ctx context.Context, arg ListCompletedPer
 }
 
 const listCompletedPeriodsMissingFinalImage = `-- name: ListCompletedPeriodsMissingFinalImage :many
-SELECT id, daily_image_id, game_type, status, phase,
+SELECT id, daily_image_id, game_type, status, phase, final_grid_size,
        started_at, ended_at, created_at, updated_at,
-       final_image_key, composed_at, prompt
+       final_image_key, composed_at
 FROM periods
 WHERE status = 'completed' AND final_image_key IS NULL
 ORDER BY ended_at DESC
@@ -367,13 +394,13 @@ func (q *Queries) ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]
 			&i.GameType,
 			&i.Status,
 			&i.Phase,
+			&i.FinalGridSize,
 			&i.StartedAt,
 			&i.EndedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.FinalImageKey,
 			&i.ComposedAt,
-			&i.Prompt,
 		); err != nil {
 			return nil, err
 		}
@@ -436,6 +463,25 @@ type SetPeriodFinalImageParams struct {
 
 func (q *Queries) SetPeriodFinalImage(ctx context.Context, arg SetPeriodFinalImageParams) error {
 	_, err := q.db.ExecContext(ctx, setPeriodFinalImage, arg.ID, arg.FinalImageKey)
+	return err
+}
+
+const unlockPhaseRing = `-- name: UnlockPhaseRing :exec
+UPDATE tiles
+SET phase_locked = FALSE, updated_at = now()
+WHERE period_id = $1 AND phase = $2 AND phase_locked = TRUE
+`
+
+type UnlockPhaseRingParams struct {
+	PeriodID uuid.UUID `json:"period_id"`
+	Phase    int32     `json:"phase"`
+}
+
+// Flips phase_locked to FALSE for every tile at the given phase. Called on
+// phase advance: the tiles in the newly-unlocked ring become playable while
+// their drawings (from earlier phases) remain untouched.
+func (q *Queries) UnlockPhaseRing(ctx context.Context, arg UnlockPhaseRingParams) error {
+	_, err := q.db.ExecContext(ctx, unlockPhaseRing, arg.PeriodID, arg.Phase)
 	return err
 }
 

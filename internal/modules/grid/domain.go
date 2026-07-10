@@ -22,29 +22,23 @@ const (
 	PeriodArchived  PeriodStatus = "archived"
 )
 
-// GameType discriminates between the two parallel games:
-//   - photo: users copy a daily image, tile by tile (the original game).
-//   - prompt: users free-draw on an empty canvas from a text prompt.
-type GameType string
-
-const (
-	GamePhoto  GameType = "photo"
-	GamePrompt GameType = "prompt"
-)
-
-func (g GameType) Valid() bool { return g == GamePhoto || g == GamePrompt }
+// GameTypePhoto is the sole game type. The prompt-based parallel game was
+// removed as part of the concentric-ring rework (see
+// docs/game-model-rework.md). The DB column stays for archive compatibility
+// but is pinned to 'photo' — never write anything else.
+const GameTypePhoto = "photo"
 
 type Period struct {
 	ID            uuid.UUID
-	DailyImageID  *uuid.UUID // nil for prompt-game periods
+	DailyImageID  uuid.UUID // always set — every period anchors to a daily image
 	GameType      string
 	Status        PeriodStatus
 	Phase         int
+	FinalGridSize int
 	StartedAt     time.Time
 	EndedAt       *time.Time
 	FinalImageKey string // empty if not yet composed
 	ComposedAt    *time.Time
-	Prompt        string // empty for photo-game periods
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -52,21 +46,21 @@ type Period struct {
 type Tile struct {
 	ID            uuid.UUID
 	PeriodID      uuid.UUID
+	// Phase is the phase at which this tile unlocks — the smallest phase whose
+	// concentric window covers it. Set once at period creation and never
+	// changed. Tiles with Phase > period.Phase are future-locked.
 	Phase         int
 	RowIndex      int
 	ColIndex      int
 	Status        TileStatus
+	// PhaseLocked is TRUE while the tile's ring hasn't unlocked yet. Flipped
+	// to FALSE on phase advance. Frontends render `PhaseLocked` differently
+	// from regular `locked` status (which means "another player is currently
+	// claiming this").
+	PhaseLocked   bool
 	SubmissionKey string // storage key of the drawn image, empty if not drawn
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
-}
-
-type GridConfig struct {
-	ID        uuid.UUID
-	Phase     int
-	Columns   int
-	Rows      int
-	CreatedAt time.Time
 }
 
 type PhaseMosaic struct {

@@ -14,18 +14,13 @@ import (
 type Querier interface {
 	DeactivateAllDailyImages(ctx context.Context) error
 	DeleteScheduledByDate(ctx context.Context, date time.Time) error
-	DeleteScheduledPromptByDate(ctx context.Context, date time.Time) error
 	GetActiveDailyImage(ctx context.Context) (DailyImage, error)
 	GetDailyImageByDate(ctx context.Context, date time.Time) (DailyImage, error)
 	GetDailyImageByID(ctx context.Context, id uuid.UUID) (DailyImage, error)
 	GetScheduledByDate(ctx context.Context, date time.Time) (DailyImageSchedule, error)
-	GetScheduledPromptByDate(ctx context.Context, date time.Time) (DailyPromptSchedule, error)
-	ListPromptScheduleRange(ctx context.Context, arg ListPromptScheduleRangeParams) ([]DailyPromptSchedule, error)
 	ListScheduleRange(ctx context.Context, arg ListScheduleRangeParams) ([]DailyImageSchedule, error)
 	UpsertDailyImage(ctx context.Context, arg UpsertDailyImageParams) (DailyImage, error)
 	UpsertScheduledImage(ctx context.Context, arg UpsertScheduledImageParams) (DailyImageSchedule, error)
-	// --- Prompt schedule (parallel "draw from a prompt" game) ---
-	UpsertScheduledPrompt(ctx context.Context, arg UpsertScheduledPromptParams) (DailyPromptSchedule, error)
 }
 
 var _ Querier = (*Queries)(nil)

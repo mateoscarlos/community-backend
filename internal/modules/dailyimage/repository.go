@@ -27,12 +27,6 @@ type Repository interface {
 	GetScheduledByDate(ctx context.Context, date time.Time) (*ScheduledImage, error)
 	ListSchedule(ctx context.Context, from, to time.Time) ([]ScheduledImage, error)
 	DeleteScheduledByDate(ctx context.Context, date time.Time) error
-
-	// --- Prompt schedule (parallel prompt-based game) ---
-	UpsertScheduledPrompt(ctx context.Context, date time.Time, prompt string) (*ScheduledPrompt, error)
-	GetScheduledPromptByDate(ctx context.Context, date time.Time) (*ScheduledPrompt, error)
-	ListPromptSchedule(ctx context.Context, from, to time.Time) ([]ScheduledPrompt, error)
-	DeleteScheduledPromptByDate(ctx context.Context, date time.Time) error
 }
 
 type postgresRepository struct {
@@ -151,59 +145,6 @@ func toDomain(row dailyimagedb.DailyImage) *DailyImage {
 		IsActive:   row.IsActive,
 		CreatedAt:  row.CreatedAt,
 		UpdatedAt:  row.UpdatedAt,
-	}
-}
-
-func (r *postgresRepository) UpsertScheduledPrompt(ctx context.Context, date time.Time, prompt string) (*ScheduledPrompt, error) {
-	row, err := r.queries.UpsertScheduledPrompt(ctx, dailyimagedb.UpsertScheduledPromptParams{
-		Date:   date,
-		Prompt: prompt,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("upsert scheduled prompt: %w", err)
-	}
-	return scheduledPromptRowToDomain(row), nil
-}
-
-func (r *postgresRepository) GetScheduledPromptByDate(ctx context.Context, date time.Time) (*ScheduledPrompt, error) {
-	row, err := r.queries.GetScheduledPromptByDate(ctx, date)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("get scheduled prompt: %w", err)
-	}
-	return scheduledPromptRowToDomain(row), nil
-}
-
-func (r *postgresRepository) ListPromptSchedule(ctx context.Context, from, to time.Time) ([]ScheduledPrompt, error) {
-	rows, err := r.queries.ListPromptScheduleRange(ctx, dailyimagedb.ListPromptScheduleRangeParams{
-		Date:   from,
-		Date_2: to,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list prompt schedule: %w", err)
-	}
-	out := make([]ScheduledPrompt, len(rows))
-	for i, row := range rows {
-		out[i] = *scheduledPromptRowToDomain(row)
-	}
-	return out, nil
-}
-
-func (r *postgresRepository) DeleteScheduledPromptByDate(ctx context.Context, date time.Time) error {
-	if err := r.queries.DeleteScheduledPromptByDate(ctx, date); err != nil {
-		return fmt.Errorf("delete scheduled prompt: %w", err)
-	}
-	return nil
-}
-
-func scheduledPromptRowToDomain(row dailyimagedb.DailyPromptSchedule) *ScheduledPrompt {
-	return &ScheduledPrompt{
-		Date:      row.Date,
-		Prompt:    row.Prompt,
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
 	}
 }
 

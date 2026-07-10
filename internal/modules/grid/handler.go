@@ -18,7 +18,7 @@ import (
 const presignExpiry = 15 * time.Minute
 
 type Handler struct {
-	svc    *Service
+	svc     *Service
 	imgRepo dailyimage.Repository
 	store   *storage.Storage
 	broker  *sse.Broker
@@ -41,12 +41,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 }
 
 func (h *Handler) getCurrent(w http.ResponseWriter, r *http.Request) {
-	gameType, err := parseGameType(r.URL.Query().Get("game_type"))
-	if err != nil {
-		httpserver.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	current, err := h.svc.GetCurrent(r.Context(), gameType)
+	current, err := h.svc.GetCurrent(r.Context())
 	if err != nil {
 		if errors.Is(err, ErrPeriodNotFound) {
 			httpserver.WriteError(w, http.StatusNotFound, "no active period")
@@ -97,11 +92,6 @@ func (h *Handler) getByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listArchive(w http.ResponseWriter, r *http.Request) {
-	gameType, err := parseGameType(r.URL.Query().Get("game_type"))
-	if err != nil {
-		httpserver.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -111,7 +101,7 @@ func (h *Handler) listArchive(w http.ResponseWriter, r *http.Request) {
 		perPage = 20
 	}
 
-	periods, err := h.svc.ListArchive(r.Context(), gameType, perPage, (page-1)*perPage)
+	periods, err := h.svc.ListArchive(r.Context(), perPage, (page-1)*perPage)
 	if err != nil {
 		h.log.Error().Err(err).Msg("list archive")
 		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
@@ -149,12 +139,9 @@ func (h *Handler) listArchive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (*periodResponse, error) {
-	// Fetch the period's own daily image (not the currently-active one), so the
-	// archive detail page shows the original picture for that day. Prompt-game
-	// periods don't have an image — only a prompt string.
 	var imageResp *imageResponse
-	if current.Period.DailyImageID != nil {
-		if imgDomain, err := h.imgRepo.GetByID(r.Context(), *current.Period.DailyImageID); err == nil {
+	if current.Period.DailyImageID != uuid.Nil {
+		if imgDomain, err := h.imgRepo.GetByID(r.Context(), current.Period.DailyImageID); err == nil {
 			if imgURL, urlErr := h.store.PresignedGetURL(r.Context(), imgDomain.StorageKey, presignExpiry); urlErr == nil {
 				imageResp = &imageResponse{
 					ID:               imgDomain.ID.String(),
@@ -170,11 +157,19 @@ func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (
 
 	tiles := make([]tileResponse, len(current.Tiles))
 	for i, t := range current.Tiles {
+		status := string(t.Status)
+		// Future-locked tiles get their own wire-format value so the
+		// frontend can render them differently from `locked` (which means
+		// "another player is currently claiming this"). See
+		// docs/game-model-rework.md §M1.6.
+		if t.PhaseLocked {
+			status = "future_locked"
+		}
 		tiles[i] = tileResponse{
 			ID:     t.ID.String(),
 			Row:    t.RowIndex,
 			Col:    t.ColIndex,
-			Status: string(t.Status),
+			Status: status,
 		}
 		if t.Status == TileDrawn && t.SubmissionKey != "" {
 			if imgURL, err := h.store.PresignedGetURL(r.Context(), t.SubmissionKey, presignExpiry); err == nil {
@@ -198,23 +193,32 @@ func (h *Handler) buildPeriodResponse(r *http.Request, current *CurrentPeriod) (
 		})
 	}
 
+	phaseWindow := PhaseWindowSize(current.Period.Phase, current.PhaseSizes)
+
+	pi := periodInfo{
+		ID:            current.Period.ID.String(),
+		GameType:      current.Period.GameType,
+		Status:        string(current.Period.Status),
+		Phase:         current.Period.Phase,
+		FinalGridSize: current.Period.FinalGridSize,
+		PhaseGridSize: phaseWindow,
+		StartedAt:     current.Period.StartedAt,
+		Image:         imageResp,
+		PhaseMosaics:  mosaicResps,
+	}
+	if current.NextPeriodStartsAt != nil {
+		pi.NextPeriodStartsAt = current.NextPeriodStartsAt
+	}
+
 	return &periodResponse{
-		Period: periodInfo{
-			ID:           current.Period.ID.String(),
-			GameType:     current.Period.GameType,
-			Status:       string(current.Period.Status),
-			Phase:        current.Period.Phase,
-			StartedAt:    current.Period.StartedAt,
-			Image:        imageResp,
-			Prompt:       current.Period.Prompt,
-			PhaseMosaics: mosaicResps,
-		},
+		Period: pi,
 		Grid: gridResponse{
-			Columns:    current.GridConfig.Columns,
-			Rows:       current.GridConfig.Rows,
-			TotalTiles: len(current.Tiles),
-			DrawnCount: int(current.DrawnCount),
-			Tiles:      tiles,
+			OuterTileDisplay: current.OuterDisplay,
+			Columns:          current.Period.FinalGridSize,
+			Rows:             current.Period.FinalGridSize,
+			TotalTiles:       len(current.Tiles),
+			DrawnCount:       int(current.DrawnCount),
+			Tiles:            tiles,
 		},
 	}, nil
 }
@@ -227,27 +231,16 @@ type periodResponse struct {
 }
 
 type periodInfo struct {
-	ID           string                `json:"id"`
-	GameType     string                `json:"game_type"`
-	Status       string                `json:"status"`
-	Phase        int                   `json:"phase"`
-	StartedAt    time.Time             `json:"started_at"`
-	Image        *imageResponse        `json:"image,omitempty"`
-	Prompt       string                `json:"prompt,omitempty"`
-	PhaseMosaics []phaseMosaicResponse `json:"phase_mosaics,omitempty"`
-}
-
-// parseGameType validates the ?game_type= query param. Defaults to photo to
-// preserve backwards compat for existing clients.
-func parseGameType(raw string) (GameType, error) {
-	if raw == "" {
-		return GamePhoto, nil
-	}
-	gt := GameType(raw)
-	if !gt.Valid() {
-		return "", errors.New("invalid game_type")
-	}
-	return gt, nil
+	ID                 string                `json:"id"`
+	GameType           string                `json:"game_type"`
+	Status             string                `json:"status"`
+	Phase              int                   `json:"phase"`
+	FinalGridSize      int                   `json:"final_grid_size"`
+	PhaseGridSize      int                   `json:"phase_grid_size"`
+	StartedAt          time.Time             `json:"started_at"`
+	NextPeriodStartsAt *time.Time            `json:"next_period_starts_at,omitempty"`
+	Image              *imageResponse        `json:"image,omitempty"`
+	PhaseMosaics       []phaseMosaicResponse `json:"phase_mosaics,omitempty"`
 }
 
 type phaseMosaicResponse struct {
@@ -266,11 +259,12 @@ type imageResponse struct {
 }
 
 type gridResponse struct {
-	Columns    int            `json:"columns"`
-	Rows       int            `json:"rows"`
-	TotalTiles int            `json:"total_tiles"`
-	DrawnCount int            `json:"drawn_count"`
-	Tiles      []tileResponse `json:"tiles"`
+	OuterTileDisplay string         `json:"outer_tile_display"`
+	Columns          int            `json:"columns"`
+	Rows             int            `json:"rows"`
+	TotalTiles       int            `json:"total_tiles"`
+	DrawnCount       int            `json:"drawn_count"`
+	Tiles            []tileResponse `json:"tiles"`
 }
 
 type tileResponse struct {

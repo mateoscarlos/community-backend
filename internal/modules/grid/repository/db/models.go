@@ -71,13 +71,13 @@ type Period struct {
 	GameType      string         `json:"game_type"`
 	Status        string         `json:"status"`
 	Phase         int32          `json:"phase"`
+	FinalGridSize int32          `json:"final_grid_size"`
 	StartedAt     time.Time      `json:"started_at"`
 	EndedAt       sql.NullTime   `json:"ended_at"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	FinalImageKey sql.NullString `json:"final_image_key"`
 	ComposedAt    sql.NullTime   `json:"composed_at"`
-	Prompt        sql.NullString `json:"prompt"`
 }
 
 type PeriodMosaic struct {
@@ -106,12 +106,13 @@ type Submission struct {
 }
 
 type Tile struct {
-	ID        uuid.UUID `json:"id"`
-	PeriodID  uuid.UUID `json:"period_id"`
-	Phase     int32     `json:"phase"`
-	RowIndex  int32     `json:"row_index"`
-	ColIndex  int32     `json:"col_index"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uuid.UUID `json:"id"`
+	PeriodID    uuid.UUID `json:"period_id"`
+	Phase       int32     `json:"phase"`
+	RowIndex    int32     `json:"row_index"`
+	ColIndex    int32     `json:"col_index"`
+	Status      string    `json:"status"`
+	PhaseLocked bool      `json:"phase_locked"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }

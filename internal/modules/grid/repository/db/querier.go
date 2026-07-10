@@ -12,21 +12,21 @@ import (
 
 type Querier interface {
 	CompletePeriod(ctx context.Context, id uuid.UUID) error
-	CountTilesByStatus(ctx context.Context, arg CountTilesByStatusParams) (CountTilesByStatusRow, error)
+	CountTilesUpToPhase(ctx context.Context, arg CountTilesUpToPhaseParams) (CountTilesUpToPhaseRow, error)
 	CreatePeriod(ctx context.Context, arg CreatePeriodParams) (Period, error)
 	CreateTile(ctx context.Context, arg CreateTileParams) (Tile, error)
-	GetActivePeriod(ctx context.Context, gameType string) (Period, error)
-	GetGridConfig(ctx context.Context, phase int32) (GridConfig, error)
+	GetActivePeriod(ctx context.Context) (Period, error)
+	GetLatestCompletedPeriod(ctx context.Context) (Period, error)
 	GetPeriodByID(ctx context.Context, id uuid.UUID) (Period, error)
 	GetPeriodByTileID(ctx context.Context, id uuid.UUID) (Period, error)
-	GetTilesByPeriodAndPhase(ctx context.Context, arg GetTilesByPeriodAndPhaseParams) ([]GetTilesByPeriodAndPhaseRow, error)
-	// Lists periods of a single game (photo or prompt) that have a composed
-	// mosaic. Includes both completed and still-active periods, so today's
-	// in-progress mosaic appears in the archive.
+	GetTilesByPeriod(ctx context.Context, periodID uuid.UUID) ([]GetTilesByPeriodRow, error)
+	// Lists periods that have a composed mosaic. Includes both completed and
+	// still-active periods, so today's in-progress mosaic appears in the archive.
 	ListCompletedPeriods(ctx context.Context, arg ListCompletedPeriodsParams) ([]Period, error)
 	ListCompletedPeriodsMissingFinalImage(ctx context.Context) ([]Period, error)
 	ListMosaicsByPeriod(ctx context.Context, periodID uuid.UUID) ([]PeriodMosaic, error)
 	SetPeriodFinalImage(ctx context.Context, arg SetPeriodFinalImageParams) error
+	UnlockPhaseRing(ctx context.Context, arg UnlockPhaseRingParams) error
 	UpdatePeriodPhase(ctx context.Context, arg UpdatePeriodPhaseParams) error
 	UpdateTileStatus(ctx context.Context, arg UpdateTileStatusParams) error
 	UpsertPeriodMosaic(ctx context.Context, arg UpsertPeriodMosaicParams) error
