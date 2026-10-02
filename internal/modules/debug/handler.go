@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -826,6 +827,28 @@ func (h *Handler) listSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A period longer than a day keeps showing a picture whose scheduled date has
+	// already gone by, and that date sits outside this forward-only window. Without
+	// the entry driving today the admin calendar renders empty while the game is
+	// happily running that image. One extra row lets the client carry it forward
+	// across the spanned days.
+	current, curErr := h.repo.GetLatestScheduledOnOrBefore(r.Context(), from)
+	switch {
+	case curErr == nil:
+		already := false
+		for _, row := range rows {
+			if sameScheduleDay(row.Date, current.Date) {
+				already = true
+				break
+			}
+		}
+		if !already {
+			rows = append([]dailyimage.ScheduledImage{*current}, rows...)
+		}
+	case !errors.Is(curErr, dailyimage.ErrNotFound):
+		h.log.Warn().Err(curErr).Msg("schedule: lookup current")
+	}
+
 	type item struct {
 		Date       string `json:"date"`
 		StorageKey string `json:"storage_key"`
@@ -919,6 +942,13 @@ func (h *Handler) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// sameScheduleDay compares two schedule dates by calendar day. The rows come
+// from a `date` column, so comparing the time.Time values directly is at the
+// mercy of the driver's timezone round-trip.
+func sameScheduleDay(a, b time.Time) bool {
+	return a.Format("2006-01-02") == b.Format("2006-01-02")
 }
 
 // isTodayInCph reports whether the given date refers to today's calendar

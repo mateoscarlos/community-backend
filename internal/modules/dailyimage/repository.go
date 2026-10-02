@@ -26,16 +26,21 @@ type Repository interface {
 	UpsertScheduled(ctx context.Context, date time.Time, storageKey string, width, height int) (*ScheduledImage, error)
 	GetScheduledByDate(ctx context.Context, date time.Time) (*ScheduledImage, error)
 	ListSchedule(ctx context.Context, from, to time.Time) ([]ScheduledImage, error)
+	// GetLatestScheduledOnOrBefore returns the newest entry dated on or before
+	// `date`. That entry is the one actually on screen right now when a period
+	// runs for longer than a day, even though its date has already passed.
+	GetLatestScheduledOnOrBefore(ctx context.Context, date time.Time) (*ScheduledImage, error)
 	DeleteScheduledByDate(ctx context.Context, date time.Time) error
 }
 
 type postgresRepository struct {
+	db      *sql.DB
 	queries *dailyimagedb.Queries
 }
 
 // NewPostgresRepository returns a Repository backed by PostgreSQL via SQLC.
 func NewPostgresRepository(sqlDB *sql.DB) Repository {
-	return &postgresRepository{queries: dailyimagedb.New(sqlDB)}
+	return &postgresRepository{db: sqlDB, queries: dailyimagedb.New(sqlDB)}
 }
 
 func (r *postgresRepository) GetActive(ctx context.Context) (*DailyImage, error) {
@@ -124,6 +129,27 @@ func (r *postgresRepository) ListSchedule(ctx context.Context, from, to time.Tim
 		out[i] = *scheduledRowToDomain(row)
 	}
 	return out, nil
+}
+
+// Raw SQL rather than a generated query so adding this doesn't drag the whole
+// repo through a sqlc version bump (the committed codegen is from v1.30.0).
+func (r *postgresRepository) GetLatestScheduledOnOrBefore(ctx context.Context, date time.Time) (*ScheduledImage, error) {
+	var s ScheduledImage
+	err := r.db.QueryRowContext(ctx,
+		`SELECT date, storage_key, width, height, created_at, updated_at
+		 FROM daily_image_schedule
+		 WHERE date <= $1
+		 ORDER BY date DESC
+		 LIMIT 1`,
+		date,
+	).Scan(&s.Date, &s.StorageKey, &s.Width, &s.Height, &s.CreatedAt, &s.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get latest scheduled on or before: %w", err)
+	}
+	return &s, nil
 }
 
 func (r *postgresRepository) DeleteScheduledByDate(ctx context.Context, date time.Time) error {
