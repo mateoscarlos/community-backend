@@ -2,6 +2,7 @@ package debug
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -901,18 +902,70 @@ func (h *Handler) upsertSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	saved, err := h.repo.UpsertScheduled(r.Context(), date, body.StorageKey, body.Width, body.Height)
+	ctx := r.Context()
+
+	// When this entry is the one driving what's on screen right now, the
+	// running period has to switch pictures too — otherwise the calendar and
+	// /play disagree until the period expires (up to a year). Swapping under
+	// existing drawings would leave them tracing the wrong photo, so that case
+	// is refused before anything is written.
+	drivesNow, err := h.schedulesCurrentPicture(ctx, date)
+	if err != nil {
+		h.log.Error().Err(err).Msg("schedule: resolve current picture")
+		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	var activePeriodID uuid.UUID
+	if drivesNow {
+		var drawn int
+		err := h.db.QueryRowContext(ctx,
+			`SELECT p.id, (SELECT count(*) FROM tiles t WHERE t.period_id = p.id AND t.status = 'drawn')
+			 FROM periods p WHERE p.status = 'active' LIMIT 1`,
+		).Scan(&activePeriodID, &drawn)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// Nothing running — the rotation below starts a period if needed.
+		case err != nil:
+			h.log.Error().Err(err).Msg("schedule: load active period")
+			httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
+			return
+		case drawn > 0:
+			httpserver.WriteError(w, http.StatusConflict,
+				"the running period already has drawings — reset it before changing its picture")
+			return
+		}
+	}
+
+	saved, err := h.repo.UpsertScheduled(ctx, date, body.StorageKey, body.Width, body.Height)
 	if err != nil {
 		h.log.Error().Err(err).Msg("schedule: upsert")
 		httpserver.WriteError(w, http.StatusInternalServerError, "upsert schedule failed")
 		return
 	}
 
-	// If admin scheduled an image for today, kick off rotation immediately so
-	// the game becomes playable without a manual "Create Period" step.
-	// Idempotent: rotateForToday bails if a period for today already exists.
-	if isTodayInCph(date) {
-		if err := h.gridSvc.RotateForToday(r.Context()); err != nil {
+	switch {
+	case drivesNow && activePeriodID != uuid.Nil:
+		img, err := h.repo.SetActive(ctx, date, body.StorageKey, body.Width, body.Height)
+		if err != nil {
+			h.log.Error().Err(err).Msg("schedule: promote to running period")
+			httpserver.WriteError(w, http.StatusInternalServerError, "scheduled, but swapping the running picture failed")
+			return
+		}
+		if _, err := h.db.ExecContext(ctx,
+			`UPDATE periods SET daily_image_id = $2, updated_at = now() WHERE id = $1`,
+			activePeriodID, img.ID,
+		); err != nil {
+			h.log.Error().Err(err).Msg("schedule: swap period image")
+			httpserver.WriteError(w, http.StatusInternalServerError, "scheduled, but swapping the running picture failed")
+			return
+		}
+		h.log.Info().Str("period_id", activePeriodID.String()).Str("date", body.Date).Msg("schedule: swapped running period picture")
+		h.broker.PublishPeriodUpdated()
+	case isTodayInCph(date):
+		// If admin scheduled an image for today, kick off rotation immediately so
+		// the game becomes playable without a manual "Create Period" step.
+		// Idempotent: rotateForToday bails if a period for today already exists.
+		if err := h.gridSvc.RotateForToday(ctx); err != nil {
 			h.log.Warn().Err(err).Msg("schedule: rotate today")
 		}
 	}
@@ -942,6 +995,29 @@ func (h *Handler) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// schedulesCurrentPicture reports whether a schedule entry for date would be
+// the picture showing right now: dated today or earlier, with no newer entry
+// on or before today superseding it.
+func (h *Handler) schedulesCurrentPicture(ctx context.Context, date time.Time) (bool, error) {
+	loc, err := time.LoadLocation(grid.PeriodTimezone)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().In(loc)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if date.Format("2006-01-02") > today.Format("2006-01-02") {
+		return false, nil
+	}
+	latest, err := h.repo.GetLatestScheduledOnOrBefore(ctx, today)
+	if errors.Is(err, dailyimage.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return latest.Date.Format("2006-01-02") <= date.Format("2006-01-02"), nil
 }
 
 // sameScheduleDay compares two schedule dates by calendar day. The rows come
