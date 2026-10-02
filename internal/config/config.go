@@ -8,8 +8,11 @@ import (
 // The app fails fast at startup if required variables are missing.
 type Config struct {
 	// Server
-	Port               string `envconfig:"PORT" default:"8080"`
-	Env                string `envconfig:"ENV" default:"local"` // local | dev | prod
+	Port string `envconfig:"PORT" default:"8080"`
+	Env  string `envconfig:"ENV" default:"local"` // local | dev | prod
+	// CORSAllowedOrigins must list the frontend origin(s). Leaving it empty
+	// makes go-chi/cors allow *every* origin, so a deploy that forgets it
+	// silently opens the API up — the router logs a warning when that happens.
 	CORSAllowedOrigins []string `envconfig:"CORS_ALLOWED_ORIGINS"`
 
 	// Admin: shared secret that gates the /debug admin endpoints. When empty
@@ -24,7 +27,7 @@ type Config struct {
 	LokiUsername string `envconfig:"LOKI_USERNAME"`
 	LokiPassword string `envconfig:"LOKI_PASSWORD"`
 
-	// Database (placeholder for next phase)
+	// Database
 	DatabaseURL string `envconfig:"DATABASE_URL"`
 
 	// Storage
