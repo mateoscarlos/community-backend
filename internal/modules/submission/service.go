@@ -2,9 +2,11 @@ package submission
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/community-app/community-backend/internal/modules/claim"
 	"github.com/community-app/community-backend/internal/modules/grid"
 	"github.com/community-app/community-backend/internal/shared/sse"
 	"github.com/community-app/community-backend/internal/shared/storage"
@@ -14,6 +16,7 @@ import (
 
 type Service struct {
 	repo    Repository
+	claims  claim.Repository
 	gridSvc *grid.Service
 	store   *storage.Storage
 	broker  *sse.Broker
@@ -22,6 +25,7 @@ type Service struct {
 
 func NewService(
 	repo Repository,
+	claims claim.Repository,
 	gridSvc *grid.Service,
 	store *storage.Storage,
 	broker *sse.Broker,
@@ -29,6 +33,7 @@ func NewService(
 ) *Service {
 	return &Service{
 		repo:    repo,
+		claims:  claims,
 		gridSvc: gridSvc,
 		store:   store,
 		broker:  broker,
@@ -36,14 +41,34 @@ func NewService(
 	}
 }
 
-// Presign generates a presigned upload URL for a tile submission.
-func (s *Service) Presign(ctx context.Context, tileID uuid.UUID, contentType string) (uploadURL, storageKey string, err error) {
+// Presign generates a presigned upload URL for a tile submission. The session
+// must hold the tile's claim: the storage key is derived from the tile ID
+// alone, and tile IDs are public, so an unguarded presign would let anyone
+// overwrite any tile's image straight in object storage.
+func (s *Service) Presign(ctx context.Context, tileID uuid.UUID, sessionID, contentType string) (uploadURL, storageKey string, err error) {
+	if err := s.assertHoldsClaim(ctx, tileID, sessionID); err != nil {
+		return "", "", err
+	}
 	storageKey = fmt.Sprintf("tiles/%s.jpg", tileID.String())
 	uploadURL, err = s.store.PresignedPutURL(ctx, storageKey, 5*time.Minute)
 	if err != nil {
 		return "", "", fmt.Errorf("submission service: presign: %w", err)
 	}
 	return uploadURL, storageKey, nil
+}
+
+// assertHoldsClaim mirrors submit_tile()'s ownership test — an unreleased
+// claim on the tile for this session. Kept no stricter than the submit path on
+// purpose, so a presign can never be refused for a claim that the subsequent
+// submit would have accepted.
+func (s *Service) assertHoldsClaim(ctx context.Context, tileID uuid.UUID, sessionID string) error {
+	if _, err := s.claims.GetActiveClaimBySessionAndTile(ctx, tileID, sessionID); err != nil {
+		if errors.Is(err, claim.ErrClaimNotFound) {
+			return ErrNotYourClaim
+		}
+		return fmt.Errorf("submission service: check claim: %w", err)
+	}
+	return nil
 }
 
 // stagingKey is the deterministic R2 key used to hand a raw phone-camera

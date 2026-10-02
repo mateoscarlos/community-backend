@@ -33,6 +33,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 func (h *Handler) presign(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TileID      string `json:"tile_id"`
+		SessionID   string `json:"session_id"`
 		ContentType string `json:"content_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -45,12 +46,20 @@ func (h *Handler) presign(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteError(w, http.StatusBadRequest, "invalid tile_id")
 		return
 	}
+	if body.SessionID == "" {
+		httpserver.WriteError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
 	if body.ContentType == "" {
 		body.ContentType = "image/jpeg"
 	}
 
-	uploadURL, storageKey, err := h.svc.Presign(r.Context(), tileID, body.ContentType)
+	uploadURL, storageKey, err := h.svc.Presign(r.Context(), tileID, body.SessionID, body.ContentType)
 	if err != nil {
+		if errors.Is(err, ErrNotYourClaim) {
+			httpserver.WriteError(w, http.StatusForbidden, "not your claim")
+			return
+		}
 		h.log.Error().Err(err).Msg("presign upload")
 		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
