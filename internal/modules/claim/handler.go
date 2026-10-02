@@ -61,6 +61,10 @@ func (h *Handler) claimTile(w http.ResponseWriter, r *http.Request) {
 			httpserver.WriteError(w, http.StatusConflict, "session already has an active claim")
 			return
 		}
+		if errors.Is(err, ErrClaimNotFound) {
+			httpserver.WriteError(w, http.StatusNotFound, "tile not found")
+			return
+		}
 		h.log.Error().Err(err).Msg("claim tile")
 		httpserver.WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
